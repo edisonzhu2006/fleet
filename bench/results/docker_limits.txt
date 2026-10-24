@@ -1,0 +1,132 @@
+######## bench/docker_limits.sh, run 1 of 3 (2026-10-24)
+== machine: Apple M5 Pro, load: 3.42 3.89 3.83
+== docker: server 29.8.2, OrbStack, kernel 7.2.12-orbstack-00394-gbecdd6130068, 18 CPUs, 12597067776 bytes, cgroup v2
+16:31:28.649 fleetlet[d1]: runtime docker (server 29.8.2), default image busybox:1.36
+
+== 1. memory: 256 MB through a 32 MB limit, and a 16 MB control under 64 MB
+ID   JOB        PRI STATE     NODE       ATT EXIT       COMMAND
+0    oom          1 failed    d1           1 oom        [busybox:1.36] /bin/sh -c echo allocating; head -c 256m /dev/zero | tail
+1    fits         1 succeeded d1           1 0          /bin/sh -c head -c 16m /dev/zero | tail >/dev/null; echo stayed under the limit
+   master log: 16:31:30.152 fleetmaster: task 0 (oom) failed on d1: OOM-killed, exit 137
+   timeline (ms after placement): container start +166, kernel oom event +650, die +776, fleetlet saw it +900 (die to fleetlet 124 ms), master recorded +1029
+   submit to OOM visible in fleetctl: 1094 ms
+   bare container: ran 269 ms from start to OOM kill (OOMKilled=true)
+   PASS: over-limit task reported as oom, control exited 0
+
+== 2. cpu: one spinning thread, --cpu 500 vs a --cpu 2000 control, 10 s window
+   task 2 -> container fleet-2-1-08c9049a, cgroup cpu.max: 50000 100000
+   ... docker stats sample: 50.01%
+   ... docker stats sample: 49.84%
+   ... docker stats sample: 50.08%
+   ... docker stats sample: 49.94%
+   ... docker stats sample: 49.96%
+   --cpu 500: cgroup usage 50.0% of one core over 10298 ms; docker stats median 49.96% (5 samples: 50.01 49.84 50.08 49.94 49.96); throttled in 103 of 103 CFS periods
+   task 3 -> container fleet-3-1-08c9049a, cgroup cpu.max: 200000 100000
+   ... docker stats sample: 101.06%
+   ... docker stats sample: 100.42%
+   ... docker stats sample: 100.32%
+   ... docker stats sample: 100.25%
+   ... docker stats sample: 100.32%
+   --cpu 2000: cgroup usage 100.3% of one core over 10141 ms; docker stats median 100.32% (5 samples: 101.06 100.42 100.32 100.25 100.32); throttled in 0 of 102 CFS periods
+   PASS: --cpu 500 held to 50.0% (expected ~50%), control 100.3%
+
+== 3. latency: docker run -d with DockerRuntime's flags, 10 times; docker inspect, 10 times
+   docker run -d (ms): 110 111 144 118 108 107 122 122 122 125
+   start latency median 118 ms, min 107, max 144
+   docker inspect (ms): 31 32 31 31 30 30 35 31 30 31
+   inspect median 31 ms
+
+== load after: 3.35 3.82 3.81
+RESULT: PASS
+
+== teardown
+no fleet containers left behind
+
+######## bench/docker_limits.sh, run 2 of 3 (2026-10-24)
+== machine: Apple M5 Pro, load: 3.35 3.82 3.81
+== docker: server 29.8.2, OrbStack, kernel 7.2.12-orbstack-00394-gbecdd6130068, 18 CPUs, 12597067776 bytes, cgroup v2
+16:31:59.393 fleetlet[d1]: runtime docker (server 29.8.2), default image busybox:1.36
+
+== 1. memory: 256 MB through a 32 MB limit, and a 16 MB control under 64 MB
+ID   JOB        PRI STATE     NODE       ATT EXIT       COMMAND
+0    oom          1 failed    d1           1 oom        [busybox:1.36] /bin/sh -c echo allocating; head -c 256m /dev/zero | tail
+1    fits         1 succeeded d1           1 0          /bin/sh -c head -c 16m /dev/zero | tail >/dev/null; echo stayed under the limit
+   master log: 16:32:00.899 fleetmaster: task 0 (oom) failed on d1: OOM-killed, exit 137
+   timeline (ms after placement): container start +201, kernel oom event +388, die +468, fleetlet saw it +557 (die to fleetlet 89 ms), master recorded +1035
+   submit to OOM visible in fleetctl: 1094 ms
+   bare container: ran 211 ms from start to OOM kill (OOMKilled=true)
+   PASS: over-limit task reported as oom, control exited 0
+
+== 2. cpu: one spinning thread, --cpu 500 vs a --cpu 2000 control, 10 s window
+   task 2 -> container fleet-2-1-6bda337d, cgroup cpu.max: 50000 100000
+   ... docker stats sample: 50.02%
+   ... docker stats sample: 50.00%
+   ... docker stats sample: 50.14%
+   ... docker stats sample: 49.87%
+   ... docker stats sample: 50.13%
+   --cpu 500: cgroup usage 50.0% of one core over 10302 ms; docker stats median 50.02% (5 samples: 50.02 50.00 50.14 49.87 50.13); throttled in 103 of 103 CFS periods
+   task 3 -> container fleet-3-1-6bda337d, cgroup cpu.max: 200000 100000
+   ... docker stats sample: 100.62%
+   ... docker stats sample: 100.46%
+   ... docker stats sample: 100.18%
+   ... docker stats sample: 100.42%
+   ... docker stats sample: 100.48%
+   --cpu 2000: cgroup usage 100.0% of one core over 10171 ms; docker stats median 100.46% (5 samples: 100.62 100.46 100.18 100.42 100.48); throttled in 0 of 101 CFS periods
+   PASS: --cpu 500 held to 50.0% (expected ~50%), control 100.0%
+
+== 3. latency: docker run -d with DockerRuntime's flags, 10 times; docker inspect, 10 times
+   docker run -d (ms): 116 112 114 116 120 223 133 141 121 141
+   start latency median 120 ms, min 112, max 223
+   docker inspect (ms): 29 31 32 31 31 34 31 33 33 30
+   inspect median 31 ms
+
+== load after: 3.53 3.82 3.81
+RESULT: PASS
+
+== teardown
+no fleet containers left behind
+
+######## bench/docker_limits.sh, run 3 of 3 (2026-10-24)
+== machine: Apple M5 Pro, load: 3.53 3.82 3.81
+== docker: server 29.8.2, OrbStack, kernel 7.2.12-orbstack-00394-gbecdd6130068, 18 CPUs, 12597067776 bytes, cgroup v2
+16:32:30.279 fleetlet[d1]: runtime docker (server 29.8.2), default image busybox:1.36
+
+== 1. memory: 256 MB through a 32 MB limit, and a 16 MB control under 64 MB
+ID   JOB        PRI STATE     NODE       ATT EXIT       COMMAND
+0    oom          1 failed    d1           1 oom        [busybox:1.36] /bin/sh -c echo allocating; head -c 256m /dev/zero | tail
+1    fits         1 succeeded d1           1 0          /bin/sh -c head -c 16m /dev/zero | tail >/dev/null; echo stayed under the limit
+   master log: 16:32:31.287 fleetmaster: task 0 (oom) failed on d1: OOM-killed, exit 137
+   timeline (ms after placement): container start +197, kernel oom event +416, die +497, fleetlet saw it +537 (die to fleetlet 40 ms), master recorded +537
+   submit to OOM visible in fleetctl: 665 ms
+   bare container: ran 215 ms from start to OOM kill (OOMKilled=true)
+   PASS: over-limit task reported as oom, control exited 0
+
+== 2. cpu: one spinning thread, --cpu 500 vs a --cpu 2000 control, 10 s window
+   task 2 -> container fleet-2-1-d9089bcf, cgroup cpu.max: 50000 100000
+   ... docker stats sample: 50.25%
+   ... docker stats sample: 50.21%
+   ... docker stats sample: 49.91%
+   ... docker stats sample: 49.92%
+   ... docker stats sample: 50.08%
+   --cpu 500: cgroup usage 50.0% of one core over 10295 ms; docker stats median 50.08% (5 samples: 50.25 50.21 49.91 49.92 50.08); throttled in 103 of 103 CFS periods
+   task 3 -> container fleet-3-1-d9089bcf, cgroup cpu.max: 200000 100000
+   ... docker stats sample: 100.43%
+   ... docker stats sample: 100.38%
+   ... docker stats sample: 100.42%
+   ... docker stats sample: 100.33%
+   ... docker stats sample: 100.31%
+   --cpu 2000: cgroup usage 100.2% of one core over 10134 ms; docker stats median 100.38% (5 samples: 100.43 100.38 100.42 100.33 100.31); throttled in 0 of 101 CFS periods
+   PASS: --cpu 500 held to 50.0% (expected ~50%), control 100.2%
+
+== 3. latency: docker run -d with DockerRuntime's flags, 10 times; docker inspect, 10 times
+   docker run -d (ms): 114 116 112 129 133 123 138 133 194 130
+   start latency median 129 ms, min 112, max 194
+   docker inspect (ms): 30 29 32 31 31 30 32 36 83 33
+   inspect median 31 ms
+
+== load after: 3.60 3.82 3.81
+RESULT: PASS
+
+== teardown
+no fleet containers left behind
+

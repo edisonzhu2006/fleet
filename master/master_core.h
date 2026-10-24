@@ -101,11 +101,13 @@ class MasterCore {
   };
   struct TaskMeta {
     std::vector<std::string> argv;
+    std::string image;  // empty: the agent runtime's default
     uint32_t attempt = 0;  // 0 = never placed
     std::optional<NodeId> last_node;
     bool has_exit = false;
     int32_t exit_code = 0;
     int32_t signal = 0;
+    bool oom_killed = false;
     std::string message;
   };
 

@@ -82,6 +82,21 @@ Agent::Key Agent::key_of(const v1::TaskInstance& inst) {
   return Key{inst.task_id(), inst.attempt(), inst.incarnation()};
 }
 
+std::string Agent::container_name(uint32_t task_id, uint32_t attempt,
+                                  uint64_t incarnation) {
+  // fleet-<task>-<attempt>-<first 8 hex digits of the incarnation>.
+  // (task, attempt) alone is unique only within one master's lifetime: a
+  // restarted master numbers tasks from 0 again, and Docker refuses a
+  // second container with a name in use (a leftover from before the
+  // restart would make every start fail). The incarnation is random per
+  // registration, so adding it makes names unique across restarts of
+  // either side, and keeps them readable in `docker ps`.
+  char inc[17];
+  std::snprintf(inc, sizeof(inc), "%016llx", static_cast<unsigned long long>(incarnation));
+  return "fleet-" + std::to_string(task_id) + "-" + std::to_string(attempt) + "-" +
+         std::string(inc, 8);
+}
+
 void Agent::run() {
   std::error_code ec;
   std::filesystem::create_directories(options_.work_dir, ec);
@@ -146,13 +161,21 @@ void Agent::collect_exits() {
     auto h = by_handle_.find(e.handle);
     if (h == by_handle_.end()) continue;
     Instance& inst = instances_.at(h->second);
-    inst.phase = v1::TaskStatus::PHASE_EXITED;
+    // A runtime with a slow start (DockerRuntime) reports a start that
+    // failed after start() returned as an exit with start_failed; to the
+    // master it is the same START_FAILED as a synchronous failure.
+    inst.phase = e.start_failed ? v1::TaskStatus::PHASE_START_FAILED
+                                : v1::TaskStatus::PHASE_EXITED;
     inst.exit_code = e.exit_code;
     inst.signal = e.signal;
+    inst.oom_killed = e.oom_killed;
+    inst.message = e.message;
     log("task " + std::to_string(h->second.task_id) + " attempt " +
-        std::to_string(h->second.attempt) + " exited: " +
-        (e.signal ? "signal " + std::to_string(e.signal)
-                  : "code " + std::to_string(e.exit_code)));
+        std::to_string(h->second.attempt) +
+        (e.start_failed ? " failed to start: " + e.message
+         : e.oom_killed ? " OOM-killed (exit " + std::to_string(e.exit_code) + ")"
+         : e.signal     ? " exited: signal " + std::to_string(e.signal)
+                        : " exited: code " + std::to_string(e.exit_code)));
     by_handle_.erase(h);
   }
 }
@@ -169,6 +192,7 @@ void Agent::do_heartbeat() {
     st->set_phase(inst.phase);
     st->set_exit_code(inst.exit_code);
     st->set_signal(inst.signal);
+    st->set_oom_killed(inst.oom_killed);
     st->set_message(inst.message);
   }
   v1::HeartbeatResponse resp;
@@ -221,11 +245,21 @@ void Agent::launch(const v1::TaskLaunch& l) {
     instances_.emplace(key, inst);
     return;
   }
+  // Same for the image: it lands in docker's argv right before the
+  // command, where a leading '-' would be read as a flag.
+  if (!l.image().empty() && !valid_image_ref(l.image())) {
+    inst.phase = v1::TaskStatus::PHASE_START_FAILED;
+    inst.message = "invalid image reference";
+    instances_.emplace(key, inst);
+    return;
+  }
   LaunchSpec spec;
   spec.argv.assign(l.argv().begin(), l.argv().end());
   spec.limits = Resources{l.limits().milli_cpu(), l.limits().memory_mb()};
   spec.log_path = options_.work_dir / (l.job() + ".t" + std::to_string(key.task_id) +
                                        ".a" + std::to_string(key.attempt) + ".log");
+  spec.image = l.image();
+  spec.name = container_name(key.task_id, key.attempt, key.incarnation);
   StartResult r = runtime_->start(spec);
   if (r.ok) {
     inst.handle = r.handle;

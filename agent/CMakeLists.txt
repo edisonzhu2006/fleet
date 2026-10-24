@@ -1,7 +1,8 @@
 # fleet_agent_lib: the Agent (register/heartbeat/reconcile loop) and the
-# Runtime interface with its ProcessRuntime implementation. fleetlet is a
+# Runtime interface with its implementations, ProcessRuntime (fork/exec)
+# and DockerRuntime (docker CLI driven through Subprocess). fleetlet is a
 # thin main over it; the integration tests run Agents in-process.
-add_library(fleet_agent_lib agent.cpp process_runtime.cpp)
+add_library(fleet_agent_lib agent.cpp process_runtime.cpp docker_runtime.cpp subprocess.cpp)
 target_include_directories(fleet_agent_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(fleet_agent_lib PUBLIC fleet_core fleet_proto fleet_common Threads::Threads
                                       PRIVATE fleet_flags)

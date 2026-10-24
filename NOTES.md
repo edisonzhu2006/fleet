@@ -494,3 +494,290 @@ in any master or agent log, and nothing left behind.
 
 Zero warnings in project code (clean Release rebuild: the only warning is
 `-Wcharacter-conversion` inside GoogleTest's own gtest-all.cc).
+
+## 2026-10-24: m2b, DockerRuntime
+
+What was built:
+- `agent/docker_runtime.{h,cpp}`: `DockerRuntime`, a second implementation
+  of the m2 `Runtime` interface. Each task is one container:
+  `docker run -d --name fleet-<task>-<attempt>-<inc8> --init --cpus=<milli/1000>
+  --memory=<mb>m --memory-swap=<mb>m <image> <cmd...>`; state, exit code and
+  OOM kill from `docker inspect`; output copied to the task's log file
+  with `docker logs`; `docker stop -t <grace>` then `docker rm`.
+- `agent/subprocess.{h,cpp}`: `Subprocess`, a non-blocking runner for the
+  docker CLI (fork/exec of an argv array, non-blocking output pipes, a
+  deadline, polled by the caller). `resolve_command` and the child's
+  signal reset moved here from ProcessRuntime so both runtimes share them.
+- Task spec gains an image: `SubmitRequest.image`, `TaskLaunch.image`,
+  `TaskInfo.image` (empty means the node runtime's default, `busybox:1.36`);
+  `fleetctl submit --image`. Exits gain an OOM flag: `ExitInfo.oom_killed`,
+  `TaskStatus.oom_killed`, `TaskInfo.oom_killed`; `fleetctl list` shows
+  `oom` in the EXIT column.
+- `fleetlet --runtime=docker|process` (default process), `--docker-image`,
+  `--docker`, `--docker-poll-ms`; all flags also accept `--flag=value`.
+  With docker, fleetlet runs `docker version` (5 s deadline) at startup
+  and exits with the reason if no daemon answers.
+- `bench/docker_limits.sh`, output in `bench/results/docker_limits.txt`.
+
+Docker on this machine: OrbStack, Docker Engine 29.8.2, Linux kernel
+7.2.12 in OrbStack's VM, cgroup v2, 18 CPUs and 12.6 GB visible to
+containers. Docker *is* installed here, so the real-Docker tests and the
+bench ran; nothing was skipped.
+
+**The docker CLI, not the Engine API.** The Engine API is HTTP/1.1 over
+the unix socket (`/var/run/docker.sock`, or OrbStack's own socket through
+the active docker context). Using it directly saves a fork/exec of the Go
+CLI per call (`docker inspect` measured at a 30 to 34 ms median, below)
+and would allow the `/events` stream instead of polling. It needs an
+HTTP client and a JSON parser, and fleet's rule is no dependencies beyond
+gRPC and Protobuf; writing both by hand is more code to defend than the
+whole runtime. The CLI already handles contexts, TLS and API version
+negotiation, and a Go template makes it print exactly the four fields we
+need. Cost: one process per call and parsing human-facing text (kept
+small by the template). The socket API, with `/events`, is the next step
+if the per-call cost matters, e.g. at hundreds of tasks per node.
+
+**Every CLI call asynchronous, not a blocking `docker run` inside
+start().** The m2 contract says start() does not block, because the agent
+calls the runtime on the same thread that heartbeats. `docker run -d`
+measured 105 to 1,617 ms (median 118 to 129 ms over 30 runs), and an
+image pull makes it seconds; a node starting ten tasks in one reply would
+miss several 500 ms heartbeats, which after m3 means being declared dead.
+So start() only spawns `docker run` and returns a handle; reap() polls
+the Subprocess. Alternatives: a worker thread per container or a pool
+that runs blocking CLI calls (threads plus a queue plus locks, for what
+is a state machine anyway); `posix_spawn` (no deadline or pipe handling
+saved, same polling). Cost: Docker's own rejections (unknown image, pull
+denied, a command missing from the image, a limit below Docker's minimum)
+arrive later, through reap(), as an exit with `start_failed`, which the
+agent reports as the same `PHASE_START_FAILED` a synchronous failure
+gets. Until then the master sees the task as running for one or two
+heartbeats.
+
+**Poll with one batched `docker inspect` every 250 ms, not `docker events`
+or `docker wait`.** One call covers every running container on the node
+(`docker inspect --format '{{.Name}} {{.State.Status}} {{.State.ExitCode}}
+{{.State.OOMKilled}}' n1 n2 ...`), so the cost is one fork per poll
+interval per node, whatever the task count. Alternatives:
+- `docker wait` per container: event-driven and exact, but a blocked CLI
+  process per task (100 tasks = 100 Go processes), and it does not say
+  whether the exit was an OOM kill, so an inspect is still needed.
+- `docker events`: one long-running stream, lowest latency. But a stream
+  can drop (daemon restart, VM sleep) and after any gap we must re-list
+  everything anyway, which is the poll. Level-triggered polling is the
+  same choice m2 made for heartbeats: a lost answer is repaired by the
+  next one.
+Cost: exit detection waits up to one poll interval plus an inspect.
+Measured (Docker's `die` event to fleetlet's log line, three bench runs):
+124, 89 and 40 ms.
+
+**Docker does the field extraction (a Go template), not a JSON parser.**
+`{{json .State}}` would need JSON parsing; the template yields four
+space-free tokens per line, and container names and status words cannot
+contain spaces. inspect prints the containers it found even when it fails
+on others (exit 1, `no such object` on stderr), so stdout is parsed
+whatever the exit code. A container is declared gone only when stderr
+names it with `no such object`; any other failure (daemon restarting,
+timeout) means "learned nothing this round", never an exit
+(`FakeDockerTest.DaemonOutageIsNotAnExit`).
+
+**OOM from Docker's `State.OOMKilled`, not from exit code 137.** 137 is
+128 + SIGKILL: an OOM kill, but also docker stop's escalation, `kill -9`
+or `exit 137`. The cgroup's OOM flag is the ground truth
+(`FakeDockerTest.Exit137WithoutOomIsNotAnOom`). Exit codes are passed
+through as Docker reports them, with `signal` left 0: Docker gives one
+integer, and reinterpreting 129..159 as signals would mislabel a program
+that exits with such a code. The message says which limit was exceeded
+("OOM-killed: exceeded its 32 MB memory limit").
+
+**Flags beyond the plain `docker run --cpus --memory`, each measured or
+tested:**
+- `--init` (tini as PID 1). Linux does not deliver a default-action
+  SIGTERM to PID 1 of a PID namespace, so `sh -c 'sleep 600'` would
+  ignore `docker stop` and die only at the SIGKILL after the grace. With
+  tini the stop is prompt and exits 143 (`RealDockerTest.StopIsPromptBecauseOfInit`,
+  well under its 10 s grace; a manual `docker stop -t 2` of three such
+  containers took 185 ms). This matches ProcessRuntime, which stops the
+  whole process group with SIGTERM.
+- `--memory-swap` equal to `--memory`. Docker's default lets a container
+  use as much swap again as its memory limit, so on a host with swap an
+  over-limit task slows down instead of being killed, and the limit is
+  really twice what the scheduler accounted.
+- No `--rm`. The exit code and the OOM flag live on the stopped
+  container; `--rm` deletes it, racing our inspect. fleet removes it
+  after reading them (`docker rm`, no `-f`: it has already exited).
+
+**Logs copied with `docker logs` before the exit is reported, not
+streamed or bind-mounted.** "Exited" then means the log file is complete,
+the guarantee ProcessRuntime gives by writing the file directly.
+Alternatives: a `docker logs -f` process per container (one more process
+per task), or bind-mounting the log directory and redirecting inside the
+container (needs a shell in every image and changes the user's command).
+Cost: the file appears only at exit (`docker logs <name>` works live), and
+stdout and stderr, written by the CLI on two streams into one file, keep
+their relative order only approximately.
+
+**Container names `fleet-<task>-<attempt>-<first 8 hex of the
+incarnation>`, not `fleet-<task>-<attempt>`.** Docker refuses a second
+container with a name in use, and (task, attempt) is unique only within
+one master's lifetime: a restarted master numbers tasks from 0 again, and
+a container left from before would make every start of the new task 0
+fail. The incarnation is random per registration (m2), so adding it keeps
+names unique across restarts of either side and readable in `docker ps`
+(`DockerArgs.ContainerNamesIncludeTaskAttemptAndIncarnation`).
+
+**Image references validated at the master and again at the agent.**
+The image sits right before the command in the argv, so an "image" of
+`--privileged` would be parsed by docker as a flag (argv arrays rule out
+shell injection, not argument injection). `valid_image_ref` (core/model.h)
+requires an alphanumeric first character and the reference alphabet.
+The master rejects at submit with INVALID_ARGUMENT, so the user sees it
+at once; the agent checks again because it does not trust the network,
+as with job names in m2. The default image lives in the runtime
+(`--docker-image`), not the master, so a ProcessRuntime node is not told
+it runs `busybox`. Pinned `busybox:1.36` rather than `:latest`, so a task
+means the same bits next month.
+
+**Stop: `docker stop -t ceil(grace)` once, retried only on evidence.**
+The CLI takes whole seconds, so a 1,500 ms grace becomes 2 s (never less
+than asked). A stop asked for while `docker run` is still in flight is
+sent the moment it returns. If a later inspect still sees the container
+running, the stop is sent again, but only when that inspect *started
+after* the previous stop finished: an older inspect may have looked
+before the stop took effect, and retrying on it would send a second
+stop whenever an inspect overlapped the first. Tests: one stop for two `stop()` calls,
+deferred stop during start, retried stop when the daemon ignores it.
+
+**kill_all waits (bounded) for in-flight `docker run`s, then one `docker
+rm -f` for all.** Killing the CLI between its create and start API calls
+leaves a created container; killing it during create can let the daemon
+finish after our rm. Waiting up to 5 s closes most of that window; a run
+still going after that (a slow pull) is killed, and can leave one
+created, never-started container. `rm -f` kills and removes in one call.
+
+**Tests use a fake docker CLI passed as a path, not placed first on
+PATH.** The fake is a /bin/sh script that records argv and keeps each
+container as a state file; tests flip a file to simulate an exit or an
+OOM. Passing its path (`DockerRuntimeOptions::docker`) instead of editing
+PATH avoids `setenv` in a process where gRPC threads from other tests may
+be calling `getenv`, which is a data race. The real-Docker tests skip
+unless `docker version` answers and `busybox:1.36` is already pulled, so
+CI (no daemon or no image) runs the fake-backed tests only and never
+pulls from the network.
+
+### Measurements (Apple M5 Pro, 18 threads, OrbStack; Release build)
+
+`bench/docker_limits.sh`, three consecutive runs, 1-minute load average
+at each start 3.42, 3.35, 3.53 (full output in
+`bench/results/docker_limits.txt`):
+
+| check | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| 256 MB through a `--mem 32` limit | `oom`, exit 137 | `oom`, exit 137 | `oom`, exit 137 |
+| control, 16 MB under `--mem 64` | exit 0 | exit 0 | exit 0 |
+| placement to container start / kernel `oom` event / `die` (ms) | 166 / 650 / 776 | 201 / 388 / 468 | 197 / 416 / 497 |
+| `die` to fleetlet sees it / master records it (ms after placement) | 124 / 1,029 | 89 / 1,035 | 40 / 537 |
+| bare container, same command: start to OOM kill (ms) | 269 | 211 | 215 |
+| `--cpu 500` spin loop: cgroup `usage_usec` over ~10.3 s | 50.0% of a core | 50.0% | 50.0% |
+| same, `docker stats` median of 5 | 49.96% | 50.02% | 50.08% |
+| same, CFS periods throttled | 103 of 103 | 103 of 103 | 103 of 103 |
+| control `--cpu 2000`, same loop | 100.3%, 0 throttled | 100.0%, 0 | 100.2%, 0 |
+| `docker run -d` with DockerRuntime's flags, median of 10 (min/max) | 118 ms (107/144) | 120 ms (112/223) | 129 ms (112/194) |
+| `docker inspect`, median of 10 | 31 ms | 31 ms | 31 ms |
+
+Two earlier full runs (16:27 and 16:28, load 3.35 and 4.76) gave the
+same CPU numbers (50.3% and 49.9%; controls 100.3% and 100.2%) and start
+medians of 122 and 127 ms, but the OOM task took 3.5 and 4.5 s from
+submit to visible: fleetlet's log shows 2.66 and 3.97 s from spawning
+`docker run` to seeing the OOM, while the control container started
+alongside it went from start to reported exit in 0.5 s, so fleet's
+pipeline was moving and the container itself ran longer before the
+kernel killed it. Those runs predate the docker-events timeline, so the
+split is not measured. It did not recur in three later bench runs or in
+eight bare `docker run`s of the same command (223 to 269 ms at
+`--cpus=0.5`, 154 to 158 ms at `--cpus=2`). The suspect is how long the
+kernel spends reclaiming before it OOM-kills under `memory.max`; not
+verified.
+
+What the numbers say:
+- Memory is enforced by the kernel, not approximated: the task is killed
+  at its limit and Docker's OOMKilled flag reaches `fleetctl list` as
+  `oom`. Submit to visible was 0.67 to 1.1 s, almost all of it pull-based
+  heartbeats (up to 500 ms for the start to reach the node, up to 500 ms
+  for the exit to reach the master); the runtime's own share, `die` to
+  fleetlet, was 40 to 124 ms, bounded by the 250 ms poll.
+- CPU is a CFS quota: `cpu.max` is `50000 100000` (50 ms per 100 ms
+  period) for `--cpu 500`, and the loop is throttled in every period and
+  held to 50.0%. The same loop with `--cpu 2000` uses a full core and is
+  never throttled, so the 50% is the limit, not the loop.
+- Start costs about 120 ms per container. A heartbeat interval (500 ms)
+  still dominates placement-to-start; the runtime adds a fifth of that.
+
+Not done, on purpose:
+- **CPU throttling is measured, not reported.** The plan's m2b line says
+  throttling is "detected and reported"; fleet reports OOM kills to the
+  master but not throttling. Reporting it means sampling each cgroup's
+  `cpu.stat` (`docker stats` or `docker exec`, one more process per task
+  per sample) and adding usage fields to TaskStatus; it fits better with
+  the m6 measurements than with a heartbeat that today carries only
+  lifecycle.
+- **Orphan containers after an agent crash.** A SIGKILLed fleetlet leaves
+  its containers running, as ProcessRuntime leaves processes (m2 known
+  gap). The names make them findable (`docker ps --filter name=^/fleet-`),
+  but several agents can share one daemon (the bench and tests do), so
+  cleanup on startup needs a per-node label (`--label fleet.node=<name>`)
+  first. Planned for m3 with the ProcessRuntime fix.
+- **Node capacity is not checked against the Docker VM.** Docker Desktop
+  and OrbStack run containers in a VM with its own CPU and memory (here
+  18 CPUs, 12.6 GB). fleetlet's `--cpu`/`--mem` must not exceed it, or the
+  scheduler will place more than the VM can hold.
+
+### Verification
+
+Tests: 86 in fleet_tests (30 new).
+- `Subprocess` (7): stdout, stderr and exit code captured; 1 MB of output
+  does not deadlock on a 64 KB pipe; poll() returns at once on a running
+  command; a command past its deadline is SIGKILLed and marked timed_out;
+  output redirected into a file; a command not on PATH fails at spawn;
+  the destructor kills and reaps.
+- `DockerArgs` (4): `--cpus` formatting (500 -> 0.5, 1 -> 0.001, 12345 ->
+  12.345), the exact run argv, image references that could be flags are
+  rejected, container names.
+- `FakeDockerTest` (14, fake CLI): availability probe (ok, daemon down,
+  no CLI); exact run argv, exit code, logs copied before the exit is
+  reported, then `docker rm`; OOM reported with the limit in the message;
+  137 without OOMKilled is not an OOM; a failed run is a start failure
+  with docker's first stderr line and a forced rm; invalid image and
+  missing CLI fail synchronously; stop is one `docker stop -t 2` for a
+  1.5 s grace; a stop during start is sent when run returns; an ignored
+  stop is retried; one inspect covers three containers; a container
+  removed behind fleet's back is reported as vanished; a daemon outage is
+  not an exit; kill_all is one `rm -f` for all; and end to end over gRPC
+  (master, Agent with DockerRuntime, fake CLI): a `--privileged` image is
+  refused at submit, the image and limits reach `docker run`, the
+  container name carries task and attempt, and an OOM kill comes back to
+  `List` as `oom_killed` with the message.
+- `RealDockerTest` (3, real daemon): exit code 3 and the container's
+  output in the log file, then the container removed; 256 MB through a
+  32 MB limit is OOM-killed (exit 137, OOMKilled); a stopped `sleep 600`
+  exits 143 well inside a 10 s grace because of `--init`.
+- `MasterCore` (2 new): images validated at submit, stored, sent in the
+  start and listed; an OOM exit is recorded and listed, a plain 137 is not.
+
+| build | command | result | load average |
+|---|---|---|---|
+| Release | `ctest --test-dir build` | 86/86, 10.40 s | 5.19 4.13 3.91 |
+| ASan + UBSan | `ctest --test-dir build-asan` | 86/86, 23.54 s | 5.12 4.17 3.93 |
+| TSan | `ctest --test-dir build-tsan` | 86/86, 107.51 s, no reports | 4.63 4.14 3.92 |
+| Release, repeated | `fleet_tests --gtest_filter='FakeDockerTest.*:Subprocess.*:RealDockerTest.*' --gtest_repeat=10` | 10/10 | 3.07 3.74 3.79 |
+| Release, concurrent | `ctest --test-dir build -j 18 --repeat until-fail:3` | 86/86, 6.42 s | 3.23 3.66 3.75 |
+
+The real-Docker tests ran (not skipped) in all three builds (3.3 to 3.9 s
+each under TSan). `bench/docker_limits.sh` with Docker off PATH
+(`PATH=/usr/bin:/bin`) prints `SKIP: Docker is not available (docker CLI
+not on PATH)` and exits 0. `bench/local_cluster.sh` (ProcessRuntime,
+load 3.26 3.68 3.75) still passes: every outcome as expected,
+placement-to-start 1 / 415 / 469 ms, nothing left behind. After all runs
+`docker ps -a --filter name=fleet-` lists no containers. Zero warnings in
+project code (clean Release rebuild; the one warning is GoogleTest's own
+`-Wcharacter-conversion` in gtest-all.cc).

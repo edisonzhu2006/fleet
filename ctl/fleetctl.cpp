@@ -2,7 +2,7 @@
 //
 //   fleetctl [--master HOST:PORT] [--timeout-ms N] <command> ...
 //     submit --job J --cpu MILLICPU --mem MB [--priority 0..3] [--count N]
-//            [--label k=v]... -- COMMAND [ARGS...]
+//            [--label k=v]... [--image IMAGE] -- COMMAND [ARGS...]
 //     list [--job J]
 //     kill --task ID | --job J
 //     drain NODE
@@ -30,7 +30,7 @@ using fleet::v1::Master;
   std::fprintf(stderr,
                "usage: fleetctl [--master HOST:PORT] [--timeout-ms N] <command>\n"
                "  submit --job J --cpu MILLICPU --mem MB [--priority 0..3] [--count N]\n"
-               "         [--label k=v]... -- COMMAND [ARGS...]\n"
+               "         [--label k=v]... [--image IMAGE] -- COMMAND [ARGS...]\n"
                "  list [--job J]\n"
                "  kill --task ID | --job J\n"
                "  drain NODE\n");
@@ -83,11 +83,15 @@ void print_list(const fleet::v1::ListResponse& r) {
   for (const auto& t : r.tasks()) {
     std::string exit = "-";
     if (t.has_exit()) {
-      exit = t.signal() ? "sig " + std::to_string(t.signal())
-             : !t.message().empty() ? "startfail"
-                                    : std::to_string(t.exit_code());
+      // OOM first: an OOM-killed container also carries a message and
+      // exit code 137, and "oom" is the part a user needs to see.
+      exit = t.oom_killed()          ? "oom"
+             : t.signal()            ? "sig " + std::to_string(t.signal())
+             : !t.message().empty()  ? "startfail"
+                                     : std::to_string(t.exit_code());
     }
-    std::string cmd;
+    // The image, when one was given, prefixes the command: "[alpine:3.20] sh -c ...".
+    std::string cmd = t.image().empty() ? "" : "[" + t.image() + "]";
     for (const auto& a : t.argv()) cmd += (cmd.empty() ? "" : " ") + a;
     std::printf("%-4u %-10s %3d %-9s %-10s %3u %-10s %s\n", t.id(), t.job().c_str(),
                 t.priority(), task_state(t.state()), t.node().empty() ? "-" : t.node().c_str(),
@@ -139,6 +143,8 @@ int main(int argc, char** argv) {
         req.set_priority(std::stoi(v));
       } else if (a == "--count") {
         req.set_count(static_cast<uint32_t>(std::stoul(v)));
+      } else if (a == "--image") {
+        req.set_image(v);
       } else if (a == "--label") {
         const size_t eq = v.find('=');
         if (eq == std::string::npos) usage();

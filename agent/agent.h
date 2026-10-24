@@ -79,6 +79,10 @@ class Agent {
   };
   Stats stats() const;  // thread-safe
 
+  // Container name DockerRuntime gives an instance; see agent.cpp.
+  static std::string container_name(uint32_t task_id, uint32_t attempt,
+                                    uint64_t incarnation);
+
  private:
   struct Key {
     uint32_t task_id = 0;
@@ -91,6 +95,7 @@ class Agent {
     v1::TaskStatus::Phase phase = v1::TaskStatus::PHASE_RUNNING;
     int exit_code = 0;
     int signal = 0;
+    bool oom_killed = false;
     std::string message;
   };
 

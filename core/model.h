@@ -90,6 +90,27 @@ inline bool valid_job_name(std::string_view job) {
   return true;
 }
 
+// Container image references ("busybox:1.36", "ghcr.io/x/y@sha256:...").
+// Not a full parse of Docker's grammar, which the daemon does anyway; the
+// point is what reaches the docker CLI's argv. The image sits right before
+// the task's command in `docker run ... IMAGE CMD`, so an "image" of
+// "--privileged" would be read by docker as a flag. So: 1..255 chars,
+// first one alphanumeric (never '-'), the rest from the reference
+// alphabet. Empty means "the runtime's default" and is checked by callers.
+inline bool valid_image_ref(std::string_view image) {
+  if (image.empty() || image.size() > 255) return false;
+  auto alnum = [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+  };
+  if (!alnum(image.front())) return false;
+  for (char c : image) {
+    if (!alnum(c) && c != '.' && c != '_' && c != '-' && c != '/' && c != ':' && c != '@') {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::string_view to_string(NodeState s);
 std::string_view to_string(TaskState s);
 

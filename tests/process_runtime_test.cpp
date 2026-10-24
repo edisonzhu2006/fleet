@@ -34,7 +34,11 @@ class ProcessRuntimeTest : public ::testing::Test {
   void TearDown() override { fs::remove_all(dir_); }
 
   LaunchSpec spec(std::vector<std::string> argv, const std::string& log = "t.log") {
-    return LaunchSpec{std::move(argv), Resources{100, 64}, dir_ / log};
+    LaunchSpec s;
+    s.argv = std::move(argv);
+    s.limits = Resources{100, 64};
+    s.log_path = dir_ / log;
+    return s;
   }
 
   // Polls reap() until n exits arrive or the deadline passes.

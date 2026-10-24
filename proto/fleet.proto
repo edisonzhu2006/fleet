@@ -97,6 +97,11 @@ message TaskStatus {
   int32 exit_code = 3;  // valid when EXITED and signal == 0
   int32 signal = 4;     // nonzero when the process died of a signal
   string message = 5;
+  // The kernel OOM-killed it for exceeding its memory limit (m2b; only a
+  // runtime with real enforcement, DockerRuntime, sets it). A separate
+  // flag rather than a guess from exit code 137, which also means "any
+  // SIGKILL" and is what docker stop's escalation produces.
+  bool oom_killed = 6;
 }
 
 message HeartbeatRequest {
@@ -115,6 +120,10 @@ message TaskLaunch {
   string job = 2;
   repeated string argv = 3;
   Resources limits = 4;  // the task's request, enforced as far as the runtime can
+  // Container image (m2b). Empty: the agent runtime's default. Ignored by
+  // ProcessRuntime. An old agent ignores this field and runs argv as a
+  // process, which is exactly the m2 behavior.
+  string image = 5;
 }
 
 message HeartbeatResponse {
@@ -140,6 +149,9 @@ message SubmitRequest {
   map<string, string> required_labels = 4;
   repeated string argv = 5;
   uint32 count = 6;    // number of identical tasks; 0 means 1
+  // Container image for DockerRuntime nodes (m2b); empty = the node's
+  // default. Validated by the master (see core/model.h valid_image_ref).
+  string image = 7;
 }
 
 message SubmitResponse {
@@ -175,6 +187,8 @@ message TaskInfo {
   int32 signal = 11;
   string message = 12;
   uint32 preempted_count = 13;
+  string image = 14;      // as submitted; empty = the node's default
+  bool oom_killed = 15;   // with has_exit: the last attempt was OOM-killed
 }
 
 message ListResponse {

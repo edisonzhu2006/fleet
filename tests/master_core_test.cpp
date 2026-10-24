@@ -353,5 +353,58 @@ TEST(MasterCore, KillByJobAndErrors) {
   EXPECT_CORE_OK(core);
 }
 
+TEST(MasterCore, ImageIsValidatedStoredAndSentWithTheStart) {
+  MasterCore core({}, 1);
+  FakeAgent ag = agent_for(register_node(core, "a"));
+  v1::SubmitRequest req;
+  req.set_job("box");
+  req.mutable_request()->set_milli_cpu(500);
+  req.mutable_request()->set_memory_mb(64);
+  req.add_argv("true");
+  v1::SubmitResponse resp;
+  // An image that docker would parse as a flag never gets admitted.
+  for (const char* bad : {"--privileged", "-v", "a b"}) {
+    req.set_image(bad);
+    EXPECT_EQ(core.submit(req, &resp).error_code(), grpc::StatusCode::INVALID_ARGUMENT) << bad;
+  }
+  EXPECT_EQ(resp.task_ids_size(), 0);
+  req.set_image("alpine:3.20");
+  ASSERT_TRUE(core.submit(req, &resp).ok());
+  req.clear_image();  // empty: the node's default
+  ASSERT_TRUE(core.submit(req, &resp).ok());
+  core.schedule();
+  auto hb = ag.beat(core);
+  ASSERT_EQ(hb.start_size(), 2);
+  EXPECT_EQ(hb.start(0).image(), "alpine:3.20");
+  EXPECT_EQ(hb.start(1).image(), "");
+  v1::ListResponse list;
+  ASSERT_TRUE(core.list({}, &list, kT0).ok());
+  EXPECT_EQ(list.tasks(0).image(), "alpine:3.20");
+  EXPECT_CORE_OK(core);
+}
+
+TEST(MasterCore, OomKillIsRecordedAndListed) {
+  MasterCore core({}, 1);
+  FakeAgent ag = agent_for(register_node(core, "a"));
+  auto ids = submit(core, "hog", 1, 500, 32, 2);
+  core.schedule();
+  // Task 0 is OOM-killed (137 + flag); task 1 exits 137 from a plain
+  // SIGKILL. Both fail; only the first is an OOM.
+  ag.exited(ids[0], 1, ag.incarnation, 137);
+  ag.req.mutable_tasks(0)->set_oom_killed(true);
+  ag.req.mutable_tasks(0)->set_message("OOM-killed: exceeded its 32 MB memory limit");
+  ag.exited(ids[1], 1, ag.incarnation, 137);
+  ag.beat(core);
+  EXPECT_EQ(core.state().task(ids[0]).state, TaskState::kFailed);
+  EXPECT_EQ(core.state().task(ids[1]).state, TaskState::kFailed);
+  v1::ListResponse list;
+  ASSERT_TRUE(core.list({}, &list, kT0).ok());
+  EXPECT_TRUE(list.tasks(0).oom_killed());
+  EXPECT_EQ(list.tasks(0).exit_code(), 137);
+  EXPECT_NE(list.tasks(0).message().find("32 MB"), std::string::npos);
+  EXPECT_FALSE(list.tasks(1).oom_killed());
+  EXPECT_CORE_OK(core);
+}
+
 }  // namespace
 }  // namespace fleet

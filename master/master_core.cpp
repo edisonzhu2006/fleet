@@ -169,6 +169,7 @@ grpc::Status MasterCore::heartbeat(const v1::HeartbeatRequest& req,
     m.has_exit = true;
     m.exit_code = st.exit_code();
     m.signal = st.signal();
+    m.oom_killed = st.oom_killed();
     m.message = st.message();
     const bool ok = st.phase() == v1::TaskStatus::PHASE_EXITED &&
                     st.signal() == 0 && st.exit_code() == 0;
@@ -179,7 +180,8 @@ grpc::Status MasterCore::heartbeat(const v1::HeartbeatRequest& req,
         " on " + nodes_[node].name + ": " +
         (st.phase() == v1::TaskStatus::PHASE_START_FAILED
              ? "start failed: " + st.message()
-             : st.signal() ? "signal " + std::to_string(st.signal())
+         : st.oom_killed() ? "OOM-killed, exit " + std::to_string(st.exit_code())
+         : st.signal()     ? "signal " + std::to_string(st.signal())
                            : "exit " + std::to_string(st.exit_code())));
   }
 
@@ -205,6 +207,7 @@ grpc::Status MasterCore::heartbeat(const v1::HeartbeatRequest& req,
     l->set_job(t.job);
     for (const std::string& a : tasks_[id].argv) l->add_argv(a);
     to_proto(t.request, l->mutable_limits());
+    l->set_image(tasks_[id].image);
   }
   return grpc::Status::OK;
 }
@@ -217,6 +220,12 @@ grpc::Status MasterCore::submit(const v1::SubmitRequest& req,
   }
   if (req.argv().empty() || req.argv(0).empty()) {
     return {grpc::StatusCode::INVALID_ARGUMENT, "empty command"};
+  }
+  // Checked here so a bad image is a submit error the user sees at once,
+  // not a start failure on some node later. The agent checks again.
+  if (!req.image().empty() && !valid_image_ref(req.image())) {
+    return {grpc::StatusCode::INVALID_ARGUMENT,
+            "invalid image reference: '" + req.image() + "'"};
   }
   const uint32_t count = req.count() == 0 ? 1 : req.count();
   if (count > options_.max_tasks_per_submit) {
@@ -253,6 +262,7 @@ grpc::Status MasterCore::submit(const v1::SubmitRequest& req,
     }
     TaskMeta m;
     m.argv.assign(req.argv().begin(), req.argv().end());
+    m.image = req.image();
     tasks_.push_back(std::move(m));
     resp->add_task_ids(r.id);
   }
@@ -296,6 +306,8 @@ grpc::Status MasterCore::list(const v1::ListRequest& req, v1::ListResponse* resp
     ti->set_signal(m.signal);
     ti->set_message(m.message);
     ti->set_preempted_count(t.preempted_count);
+    ti->set_image(m.image);
+    ti->set_oom_killed(m.oom_killed);
   }
   return grpc::Status::OK;
 }
@@ -361,6 +373,7 @@ ScheduleResult MasterCore::schedule() {
     ++m.attempt;
     m.last_node = p.node;
     m.has_exit = false;  // a new attempt has not exited yet
+    m.oom_killed = false;
     log("task " + std::to_string(p.task) + " (" + state_.task(p.task).job +
         ") placed on " + nodes_[p.node].name + ", attempt " +
         std::to_string(m.attempt));

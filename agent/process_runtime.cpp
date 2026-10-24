@@ -8,6 +8,8 @@
 
 #include "process_runtime.h"
 
+#include "subprocess.h"
+
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
@@ -22,31 +24,6 @@ extern char** environ;
 
 namespace fleet {
 namespace {
-
-// argv[0] as given if it contains '/', else the first executable regular
-// file of that name on PATH. Done in the parent, so the child can use
-// execve (async-signal-safe) instead of execvp (which searches PATH and is
-// not guaranteed to be).
-std::string resolve_command(const std::string& cmd) {
-  if (cmd.find('/') != std::string::npos) return cmd;
-  const char* env = std::getenv("PATH");
-  const std::string path = env ? env : "/usr/bin:/bin";
-  size_t start = 0;
-  while (start <= path.size()) {
-    size_t end = path.find(':', start);
-    if (end == std::string::npos) end = path.size();
-    std::string dir = path.substr(start, end - start);
-    if (dir.empty()) dir = ".";
-    const std::string candidate = dir + "/" + cmd;
-    struct stat sb {};
-    if (::stat(candidate.c_str(), &sb) == 0 && S_ISREG(sb.st_mode) &&
-        ::access(candidate.c_str(), X_OK) == 0) {
-      return candidate;
-    }
-    start = end + 1;
-  }
-  return {};
-}
 
 void close_quietly(int fd) {
   if (fd >= 0) ::close(fd);
@@ -137,14 +114,7 @@ StartResult ProcessRuntime::start(const LaunchSpec& spec) {
     // and the mask survives fork and exec, so without this a task could
     // not be stopped with SIGTERM. Also reset dispositions to default:
     // an ignored signal (SIG_IGN, e.g. SIGPIPE) stays ignored across exec.
-    sigset_t none;
-    sigemptyset(&none);
-    ::sigprocmask(SIG_SETMASK, &none, nullptr);
-    struct sigaction dfl {};
-    dfl.sa_handler = SIG_DFL;
-    for (int s = 1; s < NSIG; ++s) {
-      if (s != SIGKILL && s != SIGSTOP) ::sigaction(s, &dfl, nullptr);
-    }
+    reset_signals_in_child();
     ::dup2(null_fd, STDIN_FILENO);
     ::dup2(log_fd, STDOUT_FILENO);
     ::dup2(log_fd, STDERR_FILENO);
