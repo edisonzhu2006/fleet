@@ -1,0 +1,217 @@
+// fleet.proto: the wire contract between fleetctl, fleetmaster and fleetlet.
+//
+// WHY THIS EXISTS. Every process in fleet talks over gRPC with these
+// messages, so this file is the one place that says what crosses the
+// network. The C++ stubs are generated from it at build time
+// (proto/CMakeLists.txt), and the CLI, the agent, the master and the
+// integration tests all compile against the same generated code.
+//
+// ONE SERVICE, PULL-BASED. There is no Agent service: the master never
+// dials an agent. Each fleetlet calls Master.Heartbeat every 500 ms,
+// reporting what it actually runs, and the reply says what to start and
+// stop. This is what Borg's Borglet and Kubernetes' kubelet do. It works
+// through NAT and firewalls (only the master needs a reachable address),
+// an agent that restarts just resumes heartbeating, and a lost message is
+// repaired by the next heartbeat because the reply is recomputed from
+// desired state every time (level-triggered) rather than being a one-shot
+// command that must not be lost (edge-triggered). NOTES.md (m2) has the
+// trade-off: a placement waits up to one heartbeat interval to start.
+//
+// FIELD NUMBERS. Numbers, not names, are what go on the wire. Rules used
+// throughout, so master and agents of different versions can coexist
+// during a rollout:
+//   - numbers 1..15 encode in one byte, so they go to the fields sent on
+//     every heartbeat;
+//   - a field is never renumbered or reused; a removed field's number goes
+//     into `reserved`;
+//   - every enum's zero value is UNSPECIFIED, because proto3 decodes an
+//     unknown or missing enum as 0 and that must not read as a real state.
+// Messages that will grow in later milestones (TaskLaunch gains a restart
+// policy and a checkpoint dir in m3/m5) note where.
+
+syntax = "proto3";
+
+package fleet.v1;
+
+// Same units as core/model.h: 1000 milli-CPU is one core; memory in MB.
+message Resources {
+  int64 milli_cpu = 1;
+  int64 memory_mb = 2;
+}
+
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_READY = 1;
+  NODE_STATE_DRAINING = 2;
+  NODE_STATE_DEAD = 3;  // set by the failure detector from m3 on
+}
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_PENDING = 1;
+  TASK_STATE_RUNNING = 2;
+  TASK_STATE_SUCCEEDED = 3;
+  TASK_STATE_FAILED = 4;
+  TASK_STATE_KILLED = 5;
+}
+
+// ---------------------------------------------------------------- agents
+
+message RegisterNodeRequest {
+  string name = 1;                  // stable across agent restarts
+  Resources capacity = 2;
+  map<string, string> labels = 3;   // e.g. disk=ssd, zone=a
+}
+
+message RegisterNodeResponse {
+  uint32 node_id = 1;
+  // A fresh random 64-bit value per registration. Every task the agent
+  // starts is tagged with the incarnation it was started under, and the
+  // master stops any reported task whose incarnation is not the node's
+  // current one. That fences off processes left from a previous agent run,
+  // and, because it is random rather than a counter, also processes from
+  // before a master restart, whose task ids the new master may reuse.
+  fixed64 incarnation = 2;          // fixed64: random values are full width
+  uint32 heartbeat_interval_ms = 3; // the master tells agents its cadence
+}
+
+// One running copy of a task on one node. task_id alone is not enough:
+// a task that is preempted and later placed on the same node again is a
+// new attempt, and an exit report from the old attempt must not finish
+// the new one.
+message TaskInstance {
+  uint32 task_id = 1;
+  uint32 attempt = 2;      // bumped by the master on every placement
+  fixed64 incarnation = 3; // node incarnation the instance was started in
+}
+
+message TaskStatus {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_RUNNING = 1;
+    PHASE_EXITED = 2;        // exit_code or signal is set
+    PHASE_START_FAILED = 3;  // exec failed; message says why
+  }
+  TaskInstance instance = 1;
+  Phase phase = 2;
+  int32 exit_code = 3;  // valid when EXITED and signal == 0
+  int32 signal = 4;     // nonzero when the process died of a signal
+  string message = 5;
+}
+
+message HeartbeatRequest {
+  uint32 node_id = 1;
+  fixed64 incarnation = 2;
+  // Everything the agent runs, plus exits the master has not yet
+  // acknowledged (see HeartbeatResponse.forget). A full report every time,
+  // not a delta, so a lost heartbeat loses nothing.
+  repeated TaskStatus tasks = 3;
+}
+
+// What to run. Grows in later milestones (restart policy, checkpoint dir,
+// env); new fields get new numbers and old agents ignore them.
+message TaskLaunch {
+  TaskInstance instance = 1;
+  string job = 2;
+  repeated string argv = 3;
+  Resources limits = 4;  // the task's request, enforced as far as the runtime can
+}
+
+message HeartbeatResponse {
+  // Instances the master wants running here that the agent did not report.
+  // Re-sent on every heartbeat until reported, so the agent must ignore a
+  // start for an instance it already has.
+  repeated TaskLaunch start = 1;
+  // Instances the agent reported running that should not be: killed,
+  // preempted, drained, or from a stale incarnation.
+  repeated TaskInstance stop = 2;
+  // Exits the master has recorded; the agent stops reporting them. Until
+  // then it reports them every heartbeat, so an exit survives a lost
+  // heartbeat or reply.
+  repeated TaskInstance forget = 3;
+}
+
+// ---------------------------------------------------------------- users
+
+message SubmitRequest {
+  string job = 1;      // [A-Za-z0-9._-]{1,64}; also names the log files
+  int32 priority = 2;  // 0 batch .. 3 critical
+  Resources request = 3;
+  map<string, string> required_labels = 4;
+  repeated string argv = 5;
+  uint32 count = 6;    // number of identical tasks; 0 means 1
+}
+
+message SubmitResponse {
+  repeated uint32 task_ids = 1;
+}
+
+message ListRequest {
+  string job = 1;  // empty: all jobs
+}
+
+message NodeInfo {
+  uint32 id = 1;
+  string name = 2;
+  NodeState state = 3;
+  Resources capacity = 4;
+  Resources allocated = 5;
+  map<string, string> labels = 6;
+  int64 ms_since_heartbeat = 7;
+  uint32 running_tasks = 8;
+}
+
+message TaskInfo {
+  uint32 id = 1;
+  string job = 2;
+  int32 priority = 3;
+  TaskState state = 4;
+  Resources request = 5;
+  string node = 6;   // node it runs on; if not running, the last one it ran on
+  uint32 attempt = 7;
+  repeated string argv = 8;
+  bool has_exit = 9;  // exit_code / signal / message are meaningful
+  int32 exit_code = 10;
+  int32 signal = 11;
+  string message = 12;
+  uint32 preempted_count = 13;
+}
+
+message ListResponse {
+  repeated NodeInfo nodes = 1;
+  repeated TaskInfo tasks = 2;
+}
+
+message KillRequest {
+  oneof target {
+    uint32 task_id = 1;
+    string job = 2;  // every live task of the job
+  }
+}
+
+message KillResponse {
+  repeated uint32 killed = 1;
+}
+
+message DrainRequest {
+  string node = 1;
+}
+
+message DrainResponse {
+  repeated uint32 evicted = 1;  // tasks sent back to pending
+}
+
+service Master {
+  // Agent-facing.
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  // NOT_FOUND: unknown node id (master restarted); FAILED_PRECONDITION:
+  // stale incarnation. Either way the agent registers again.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // User-facing (fleetctl).
+  // INVALID_ARGUMENT for a bad spec, RESOURCE_EXHAUSTED when over quota.
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Kill(KillRequest) returns (KillResponse);
+  rpc Drain(DrainRequest) returns (DrainResponse);
+}

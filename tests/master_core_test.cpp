@@ -1,0 +1,357 @@
+// Tests for MasterCore with no network and no threads: registration and
+// incarnations, heartbeat reconciliation (start until reported, stop what
+// is not current, apply and acknowledge exits exactly once), admission,
+// kill and drain. Each test drives the core call by call with an explicit
+// clock and checks MasterCore::check_invariants() along the way.
+
+#include <gtest/gtest.h>
+
+#include <string>
+
+#include "master_core.h"
+
+namespace fleet {
+namespace {
+
+#define EXPECT_CORE_OK(core)                                   \
+  do {                                                         \
+    const std::string fleet_err = (core).check_invariants();   \
+    EXPECT_TRUE(fleet_err.empty()) << fleet_err;               \
+  } while (0)
+
+const Clock::time_point kT0{};
+
+v1::RegisterNodeResponse register_node(MasterCore& core, const std::string& name,
+                                       int64_t mcpu = 4000, int64_t mem = 4096) {
+  v1::RegisterNodeRequest req;
+  req.set_name(name);
+  req.mutable_capacity()->set_milli_cpu(mcpu);
+  req.mutable_capacity()->set_memory_mb(mem);
+  v1::RegisterNodeResponse resp;
+  grpc::Status s = core.register_node(req, &resp, kT0);
+  EXPECT_TRUE(s.ok()) << s.error_message();
+  return resp;
+}
+
+std::vector<uint32_t> submit(MasterCore& core, const std::string& job, int prio,
+                             int64_t mcpu, int64_t mem, uint32_t count = 1) {
+  v1::SubmitRequest req;
+  req.set_job(job);
+  req.set_priority(prio);
+  req.mutable_request()->set_milli_cpu(mcpu);
+  req.mutable_request()->set_memory_mb(mem);
+  req.add_argv("true");
+  req.set_count(count);
+  v1::SubmitResponse resp;
+  grpc::Status s = core.submit(req, &resp);
+  EXPECT_TRUE(s.ok()) << s.error_message();
+  return {resp.task_ids().begin(), resp.task_ids().end()};
+}
+
+// Builds heartbeats the way an agent would.
+struct FakeAgent {
+  uint32_t node_id;
+  uint64_t incarnation;
+  v1::HeartbeatRequest req;
+
+  void running(uint32_t task, uint32_t attempt, uint64_t inc) {
+    auto* st = req.add_tasks();
+    st->mutable_instance()->set_task_id(task);
+    st->mutable_instance()->set_attempt(attempt);
+    st->mutable_instance()->set_incarnation(inc);
+    st->set_phase(v1::TaskStatus::PHASE_RUNNING);
+  }
+  void exited(uint32_t task, uint32_t attempt, uint64_t inc, int code) {
+    auto* st = req.add_tasks();
+    st->mutable_instance()->set_task_id(task);
+    st->mutable_instance()->set_attempt(attempt);
+    st->mutable_instance()->set_incarnation(inc);
+    st->set_phase(v1::TaskStatus::PHASE_EXITED);
+    st->set_exit_code(code);
+  }
+  v1::HeartbeatResponse beat(MasterCore& core) {
+    req.set_node_id(node_id);
+    req.set_incarnation(incarnation);
+    v1::HeartbeatResponse resp;
+    grpc::Status s = core.heartbeat(req, &resp, kT0);
+    EXPECT_TRUE(s.ok()) << s.error_message();
+    req.clear_tasks();
+    return resp;
+  }
+};
+
+FakeAgent agent_for(const v1::RegisterNodeResponse& r) {
+  return FakeAgent{r.node_id(), r.incarnation(), {}};
+}
+
+TEST(MasterCore, RegisterAssignsIdsAndIncarnations) {
+  MasterCore core({}, 1);
+  auto a = register_node(core, "a");
+  auto b = register_node(core, "b");
+  EXPECT_EQ(a.node_id(), 0u);
+  EXPECT_EQ(b.node_id(), 1u);
+  EXPECT_NE(a.incarnation(), 0u);
+  EXPECT_NE(a.incarnation(), b.incarnation());
+  EXPECT_EQ(a.heartbeat_interval_ms(), 500u);
+
+  v1::RegisterNodeRequest bad;
+  v1::RegisterNodeResponse resp;
+  EXPECT_EQ(core.register_node(bad, &resp, kT0).error_code(),
+            grpc::StatusCode::INVALID_ARGUMENT);  // no name
+  bad.set_name("c");
+  EXPECT_EQ(core.register_node(bad, &resp, kT0).error_code(),
+            grpc::StatusCode::INVALID_ARGUMENT);  // zero capacity
+  EXPECT_CORE_OK(core);
+}
+
+TEST(MasterCore, StartIsResentUntilReportedThenNotAgain) {
+  MasterCore core({}, 1);
+  FakeAgent ag = agent_for(register_node(core, "a"));
+  auto ids = submit(core, "web", 1, 1000, 512);
+  core.schedule();
+  ASSERT_EQ(core.state().task(ids[0]).state, TaskState::kRunning);
+  EXPECT_EQ(core.attempt(ids[0]), 1u);
+
+  // A lost reply is repaired: the next heartbeat carries the start again.
+  for (int i = 0; i < 2; ++i) {
+    auto resp = ag.beat(core);
+    ASSERT_EQ(resp.start_size(), 1);
+    EXPECT_EQ(resp.start(0).instance().task_id(), ids[0]);
+    EXPECT_EQ(resp.start(0).instance().attempt(), 1u);
+    EXPECT_EQ(resp.start(0).instance().incarnation(), ag.incarnation);
+    EXPECT_EQ(resp.start(0).job(), "web");
+    ASSERT_EQ(resp.start(0).argv_size(), 1);
+    EXPECT_EQ(resp.start(0).limits().milli_cpu(), 1000);
+  }
+  ag.running(ids[0], 1, ag.incarnation);
+  auto resp = ag.beat(core);
+  EXPECT_EQ(resp.start_size(), 0);
+  EXPECT_EQ(resp.stop_size(), 0);
+  EXPECT_CORE_OK(core);
+}
+
+TEST(MasterCore, ExitIsAppliedOnceAndAcknowledged) {
+  MasterCore core({}, 1);
+  FakeAgent ag = agent_for(register_node(core, "a"));
+  auto ids = submit(core, "batch", 0, 1000, 512, 2);
+  core.schedule();
+  ag.exited(ids[0], 1, ag.incarnation, 0);
+  ag.exited(ids[1], 1, ag.incarnation, 7);
+  auto resp = ag.beat(core);
+  EXPECT_EQ(resp.forget_size(), 2);
+  EXPECT_EQ(resp.start_size(), 0);  // an exited task is not restarted
+  EXPECT_EQ(core.state().task(ids[0]).state, TaskState::kSucceeded);
+  EXPECT_EQ(core.state().task(ids[1]).state, TaskState::kFailed);
+
+  // The agent did not see the forget (lost reply) and reports again: still
+  // acknowledged, nothing changes.
+  ag.exited(ids[1], 1, ag.incarnation, 7);
+  resp = ag.beat(core);
+  EXPECT_EQ(resp.forget_size(), 1);
+  EXPECT_EQ(core.state().task(ids[1]).state, TaskState::kFailed);
+  EXPECT_EQ(core.state().node(0).allocated, Resources{});
+  EXPECT_CORE_OK(core);
+}
+
+TEST(MasterCore, ExitFreesRoomAndTheSameReplyStartsTheNextTask) {
+  MasterCore core({}, 1);
+  FakeAgent ag = agent_for(register_node(core, "a", 1000, 1024));
+  auto first = submit(core, "batch", 0, 1000, 512);
+  auto second = submit(core, "batch", 0, 1000, 512);
+  core.schedule();
+  ASSERT_EQ(core.state().task(second[0]).state, TaskState::kPending);  // no room
+  ag.running(first[0], 1, ag.incarnation);
+  ag.beat(core);
+
+  // The heartbeat that reports the exit also carries the start for the
+  // task that now fits, without waiting for the scheduler thread.
+  ag.exited(first[0], 1, ag.incarnation, 0);
+  auto resp = ag.beat(core);
+  ASSERT_EQ(resp.start_size(), 1);
+  EXPECT_EQ(resp.start(0).instance().task_id(), second[0]);
+  EXPECT_EQ(resp.start(0).instance().attempt(), 1u);
+  EXPECT_CORE_OK(core);
+}
+
+TEST(MasterCore, StopsKilledStaleAttemptAndUnknownInstances) {
+  MasterCore core({}, 1);
+  FakeAgent ag = agent_for(register_node(core, "a"));
+  auto ids = submit(core, "web", 1, 1000, 512, 2);
+  core.schedule();
+
+  v1::KillRequest kreq;
+  kreq.set_task_id(ids[0]);
+  v1::KillResponse kresp;
+  ASSERT_TRUE(core.kill(kreq, &kresp).ok());
+  ASSERT_EQ(kresp.killed_size(), 1);
+
+  ag.running(ids[0], 1, ag.incarnation);       // killed: stop
+  ag.running(ids[1], 99, ag.incarnation);      // wrong attempt: stop
+  ag.running(12345, 1, ag.incarnation);        // unknown task: stop
+  ag.running(ids[1], 1, ag.incarnation + 1);   // wrong incarnation: stop
+  auto resp = ag.beat(core);
+  EXPECT_EQ(resp.stop_size(), 4);
+  // The current instance of ids[1] was never reported, so it is started.
+  ASSERT_EQ(resp.start_size(), 1);
+  EXPECT_EQ(resp.start(0).instance().task_id(), ids[1]);
+
+  // An exit from the stale attempt must not finish the current one.
+  ag.exited(ids[1], 99, ag.incarnation, 0);
+  resp = ag.beat(core);
+  EXPECT_EQ(resp.forget_size(), 1);
+  EXPECT_EQ(core.state().task(ids[1]).state, TaskState::kRunning);
+  EXPECT_CORE_OK(core);
+}
+
+TEST(MasterCore, HeartbeatRejectsUnknownNodeAndStaleIncarnation) {
+  MasterCore core({}, 1);
+  auto first = register_node(core, "a");
+  v1::HeartbeatRequest req;
+  v1::HeartbeatResponse resp;
+  req.set_node_id(7);
+  EXPECT_EQ(core.heartbeat(req, &resp, kT0).error_code(), grpc::StatusCode::NOT_FOUND);
+
+  auto second = register_node(core, "a");  // the agent restarted
+  EXPECT_EQ(second.node_id(), first.node_id());
+  EXPECT_NE(second.incarnation(), first.incarnation());
+  req.set_node_id(first.node_id());
+  req.set_incarnation(first.incarnation());
+  EXPECT_EQ(core.heartbeat(req, &resp, kT0).error_code(),
+            grpc::StatusCode::FAILED_PRECONDITION);
+  req.set_incarnation(second.incarnation());
+  EXPECT_TRUE(core.heartbeat(req, &resp, kT0).ok());
+  EXPECT_CORE_OK(core);
+}
+
+TEST(MasterCore, ReRegisterRequeuesTasksAtANewAttempt) {
+  MasterCore core({}, 1);
+  auto first = register_node(core, "a");
+  auto ids = submit(core, "web", 1, 1000, 512);
+  core.schedule();
+  EXPECT_EQ(core.attempt(ids[0]), 1u);
+
+  auto second = register_node(core, "a");
+  EXPECT_EQ(core.state().task(ids[0]).state, TaskState::kPending);
+  core.schedule();
+  EXPECT_EQ(core.attempt(ids[0]), 2u);
+
+  // A survivor of the old incarnation is stopped; the new attempt starts.
+  FakeAgent ag = agent_for(second);
+  ag.running(ids[0], 1, first.incarnation());
+  auto resp = ag.beat(core);
+  ASSERT_EQ(resp.stop_size(), 1);
+  EXPECT_EQ(resp.stop(0).incarnation(), first.incarnation());
+  ASSERT_EQ(resp.start_size(), 1);
+  EXPECT_EQ(resp.start(0).instance().attempt(), 2u);
+
+  // Changing shape on re-registration is refused.
+  v1::RegisterNodeRequest req;
+  req.set_name("a");
+  req.mutable_capacity()->set_milli_cpu(8000);
+  req.mutable_capacity()->set_memory_mb(4096);
+  v1::RegisterNodeResponse r;
+  EXPECT_EQ(core.register_node(req, &r, kT0).error_code(),
+            grpc::StatusCode::FAILED_PRECONDITION);
+  EXPECT_CORE_OK(core);
+}
+
+TEST(MasterCore, SubmitValidation) {
+  MasterCore core({}, 1);
+  v1::SubmitRequest req;
+  v1::SubmitResponse resp;
+  req.mutable_request()->set_milli_cpu(100);
+  req.mutable_request()->set_memory_mb(100);
+  req.add_argv("true");
+  for (const char* bad : {"", "../etc", "a/b", ".", "..", "has space"}) {
+    req.set_job(bad);
+    EXPECT_EQ(core.submit(req, &resp).error_code(), grpc::StatusCode::INVALID_ARGUMENT)
+        << bad;
+  }
+  req.set_job("ok.job-1_x");
+  req.set_priority(9);
+  EXPECT_EQ(core.submit(req, &resp).error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+  req.set_priority(1);
+  req.clear_argv();
+  EXPECT_EQ(core.submit(req, &resp).error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+  req.add_argv("true");
+  req.set_count(100000);
+  EXPECT_EQ(core.submit(req, &resp).error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(core.state().tasks().size(), 0u);
+  req.set_count(3);
+  ASSERT_TRUE(core.submit(req, &resp).ok());
+  EXPECT_EQ(resp.task_ids_size(), 3);
+  EXPECT_CORE_OK(core);
+}
+
+TEST(MasterCore, DrainEvictsAndTasksMoveWithNewAttempt) {
+  MasterCore core({}, 1);
+  FakeAgent a = agent_for(register_node(core, "a"));
+  FakeAgent b = agent_for(register_node(core, "b"));
+  auto ids = submit(core, "web", 1, 1000, 512);
+  core.schedule();
+  const NodeId first = *core.state().task(ids[0]).node;
+  FakeAgent& on = first == a.node_id ? a : b;
+  FakeAgent& other = first == a.node_id ? b : a;
+  on.running(ids[0], 1, on.incarnation);
+  on.beat(core);
+
+  v1::DrainRequest dreq;
+  dreq.set_node(first == a.node_id ? "a" : "b");
+  v1::DrainResponse dresp;
+  ASSERT_TRUE(core.drain(dreq, &dresp).ok());
+  ASSERT_EQ(dresp.evicted_size(), 1);
+  core.schedule();
+  EXPECT_EQ(core.state().task(ids[0]).node, other.node_id);
+  EXPECT_EQ(core.attempt(ids[0]), 2u);
+
+  on.running(ids[0], 1, on.incarnation);
+  EXPECT_EQ(on.beat(core).stop_size(), 1);
+  auto resp = other.beat(core);
+  ASSERT_EQ(resp.start_size(), 1);
+  EXPECT_EQ(resp.start(0).instance().attempt(), 2u);
+
+  dreq.set_node("nope");
+  EXPECT_EQ(core.drain(dreq, &dresp).error_code(), grpc::StatusCode::NOT_FOUND);
+  EXPECT_CORE_OK(core);
+}
+
+TEST(MasterCore, PreemptionStopsVictimAndStartsPreemptor) {
+  MasterCore core({}, 1);
+  FakeAgent ag = agent_for(register_node(core, "a", 2000, 2048));
+  auto batch = submit(core, "batch", 0, 1000, 512, 2);
+  core.schedule();
+  ag.running(batch[0], 1, ag.incarnation);
+  ag.running(batch[1], 1, ag.incarnation);
+  ag.beat(core);
+
+  auto prod = submit(core, "prod", 2, 1000, 512);
+  core.schedule();
+  ASSERT_EQ(core.state().task(prod[0]).state, TaskState::kRunning);
+  ag.running(batch[0], 1, ag.incarnation);
+  ag.running(batch[1], 1, ag.incarnation);
+  auto resp = ag.beat(core);
+  EXPECT_EQ(resp.stop_size(), 1);  // exactly one victim
+  ASSERT_EQ(resp.start_size(), 1);
+  EXPECT_EQ(resp.start(0).instance().task_id(), prod[0]);
+  EXPECT_CORE_OK(core);
+}
+
+TEST(MasterCore, KillByJobAndErrors) {
+  MasterCore core({}, 1);
+  register_node(core, "a");
+  submit(core, "j", 1, 1000, 512, 3);
+  v1::KillRequest req;
+  v1::KillResponse resp;
+  EXPECT_EQ(core.kill(req, &resp).error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+  req.set_job("j");
+  ASSERT_TRUE(core.kill(req, &resp).ok());
+  EXPECT_EQ(resp.killed_size(), 3);
+  req.set_task_id(0);
+  EXPECT_EQ(core.kill(req, &resp).error_code(), grpc::StatusCode::FAILED_PRECONDITION);
+  req.set_task_id(99);
+  EXPECT_EQ(core.kill(req, &resp).error_code(), grpc::StatusCode::NOT_FOUND);
+  EXPECT_CORE_OK(core);
+}
+
+}  // namespace
+}  // namespace fleet

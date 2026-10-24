@@ -20,7 +20,7 @@ from their last checkpoint, so the job's output is still exactly-once.
         |  scheduler loop   |
         |  reconciler       |
         +-------------------+
-          ^ gRPC heartbeats| gRPC assign / stop
+          ^ gRPC heartbeats| reply: start / stop
           |   + task state v
    +-----------+  +-----------+  +-----------+
    | fleetlet  |  | fleetlet  |  | fleetlet  |   one per node
@@ -56,8 +56,8 @@ if the master dies", and "how did you test that".
 
 | component | what it is |
 |---|---|
-| `proto/` | `fleet.proto`: gRPC services (`Master`, `Agent`) and Protobuf messages; CMake generates C++ stubs |
-| `master/` | fleetmaster: cluster state, scheduler, reconciler, failure detector, WAL + snapshot, TCP server |
+| `proto/` | `fleet.proto`: gRPC service `Master` (agents pull work over heartbeats, so there is no `Agent` service) and Protobuf messages; CMake generates C++ stubs |
+| `master/` | fleetmaster: cluster state, scheduler, reconciler, failure detector, WAL + snapshot, gRPC server |
 | `agent/` | fleetlet: registers with the master, heartbeats, runs tasks through a `Runtime` interface: `DockerRuntime` (docker run with --cpus/--memory, cgroup-enforced) or `ProcessRuntime` (fork/exec + rlimits, for tests and CI), reports exits |
 | `ctl/` | fleetctl: submit, list, kill, drain node, show events |
 | `sim/` | in-process simulated cluster (hundreds of fake nodes) for placement and scale tests without real processes |

@@ -44,6 +44,27 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# Static libraries that depend on each other (fleet_master_lib and
+# fleet_agent_lib both need fleet_core and fleet_proto) appear more than
+# once on a link line by design; CMake repeats them so single-pass linkers
+# resolve every symbol. Apple's ld warns about the repeats, so the warning
+# is turned off there rather than reordering libraries by hand.
+if(APPLE)
+  add_link_options(LINKER:-no_warn_duplicate_libraries)
+endif()
+
+# gRPC and Protobuf (m2 on). Both in CONFIG mode: the anaconda builds ship
+# CMake package files, which give imported targets (protobuf::protoc,
+# gRPC::grpc_cpp_plugin, gRPC::grpc++) instead of variables. Protobuf falls
+# back to CMake's own FindProtobuf module for distributions (Debian/Ubuntu)
+# that package protobuf without its CMake config.
+find_package(Protobuf CONFIG QUIET)
+if(NOT Protobuf_FOUND)
+  find_package(Protobuf REQUIRED)
+endif()
+find_package(gRPC CONFIG REQUIRED)
+message(STATUS "fleet: gRPC ${gRPC_VERSION}, Protobuf ${Protobuf_VERSION}")
+
 if(FLEET_BUILD_TESTS)
   include(FetchContent)
   FetchContent_Declare(googletest
@@ -56,9 +77,11 @@ if(FLEET_BUILD_TESTS)
 endif()
 
 # Each component owns its CMakeLists.txt. Libraries: fleet_core (model +
-# scheduler, pure), fleet_proto (gRPC/Protobuf stubs, m2). Executables:
-# fleetmaster, fleetlet, fleetctl, fleetsim. Tests: tests/*.cpp -> fleet_tests.
-foreach(dir core proto master agent ctl sim)
+# scheduler, pure), fleet_proto (gRPC/Protobuf stubs), fleet_master_lib
+# (master logic + gRPC server), fleet_agent_lib (agent + runtimes).
+# Executables: fleetmaster, fleetlet, fleetctl, fleetsim. Tests:
+# tests/*.cpp -> fleet_tests.
+foreach(dir common core proto master agent ctl sim)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${dir}/CMakeLists.txt)
     add_subdirectory(${dir})
   endif()
@@ -75,6 +98,18 @@ if(FLEET_BUILD_TESTS)
       endif()
     endforeach()
     target_include_directories(fleet_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    gtest_discover_tests(fleet_tests)
+    # Under ASan, turn off exactly one check: container-overflow. Protobuf's
+    # RepeatedField marks its unused capacity poisoned through ASan
+    # annotations in its *headers* (compiled here, instrumented), but the
+    # prebuilt libprotobuf that fills the field while parsing a gRPC reply
+    # is not instrumented and never updates those marks, so our first read
+    # of a parsed repeated field is reported as an overflow. This is the
+    # mixed-instrumentation false positive the ASan docs describe; heap
+    # overflow, use-after-free and the rest stay on.
+    if(FLEET_SANITIZE STREQUAL "address")
+      gtest_discover_tests(fleet_tests PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_container_overflow=0")
+    else()
+      gtest_discover_tests(fleet_tests)
+    endif()
   endif()
 endif()

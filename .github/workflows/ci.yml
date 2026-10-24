@@ -16,10 +16,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install ninja
+      # gRPC and Protobuf from the distribution (m2 on). Locally they come
+      # from anaconda; CI uses the system packages, found the same way
+      # (find_package CONFIG, with FindProtobuf as the fallback).
+      - name: Install ninja, gRPC, Protobuf
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y ninja-build; fi
-          if [ "$RUNNER_OS" = "macOS" ]; then brew install ninja; fi
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y ninja-build libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install ninja grpc protobuf; fi
       - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFLEET_SANITIZE=${{ matrix.sanitize }}
       - run: cmake --build build
       - run: ctest --test-dir build --output-on-failure

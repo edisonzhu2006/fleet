@@ -76,6 +76,20 @@ enum class TaskState : uint8_t {
   kKilled,     // terminal: user killed it
 };
 
+// Job names: [A-Za-z0-9._-]{1,64}, and not "." or "..". They end up in
+// log file names on agents, so anything that could be a path ("../x",
+// "a/b") is rejected. The master checks at admission and the agent checks
+// again before using one, because the agent should not trust the network.
+inline bool valid_job_name(std::string_view job) {
+  if (job.empty() || job.size() > 64 || job == "." || job == "..") return false;
+  for (char c : job) {
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+    if (!ok) return false;
+  }
+  return true;
+}
+
 std::string_view to_string(NodeState s);
 std::string_view to_string(TaskState s);
 

@@ -1,0 +1,86 @@
+== machine: Apple M5 Pro, load: 2.70 4.80 5.33
+== submitting (cluster capacity 10000m / 14336MB)
+submitted job crunch: 0 1 2 3 4 5
+submitted job web: 6 7 8
+submitted job ssd: 9
+submitted job flaky: 10
+submitted job huge: 11
+submitted job long: 12
+
+== after 1 s
+NODE       STATE     CPU alloc/cap     MEM alloc/cap     TASKS  LAST HB
+n1         ready     3500/4000m        1024/4096MB           3    351ms
+n2         ready     4000/4000m        1408/8192MB           4    351ms
+n3         ready     2000/2000m        512/2048MB            2    351ms
+
+ID   JOB        PRI STATE     NODE       ATT EXIT       COMMAND
+0    crunch       0 running   n3           1 -          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+1    crunch       0 running   n3           1 -          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+2    crunch       0 pending   n2           2 -          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+3    crunch       0 pending   n1           1 -          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+4    crunch       0 running   n1           1 -          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+5    crunch       0 running   n1           1 -          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+6    web          2 running   n2           1 -          /bin/sh -c echo serving; sleep 4 fleet_lc_17235
+7    web          2 running   n2           1 -          /bin/sh -c echo serving; sleep 4 fleet_lc_17235
+8    web          2 running   n1           1 -          /bin/sh -c echo serving; sleep 4 fleet_lc_17235
+9    ssd          1 running   n2           1 -          /bin/sh -c echo on an ssd node; sleep 1 fleet_lc_17235
+10   flaky        1 failed    n1           1 2          /bin/sh -c echo about to fail >&2; exit 2 fleet_lc_17235
+11   huge         1 pending   -            0 -          /bin/sh -c echo never placed fleet_lc_17235
+12   long         0 running   n2           1 -          /bin/sh -c sleep 600 fleet_lc_17235
+
+== kill job long; drain n3
+killed 1 task(s)
+drained n3: 2 task(s) back to pending
+  ... 6 running, 1 pending
+
+== settled after 6028 ms
+NODE       STATE     CPU alloc/cap     MEM alloc/cap     TASKS  LAST HB
+n1         ready     0/4000m           0/4096MB              0    186ms
+n2         ready     0/4000m           0/8192MB              0    180ms
+n3         draining  0/2000m           0/2048MB              0    186ms
+
+ID   JOB        PRI STATE     NODE       ATT EXIT       COMMAND
+0    crunch       0 succeeded n2           2 0          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+1    crunch       0 succeeded n1           2 0          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+2    crunch       0 succeeded n1           3 0          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+3    crunch       0 succeeded n2           2 0          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+4    crunch       0 succeeded n1           1 0          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+5    crunch       0 succeeded n1           1 0          /bin/sh -c n=0; while [ $n -lt 400000 ]; do n=$((n+1)); done; echo crunched $n fleet_lc_17235
+6    web          2 succeeded n2           1 0          /bin/sh -c echo serving; sleep 4 fleet_lc_17235
+7    web          2 succeeded n2           1 0          /bin/sh -c echo serving; sleep 4 fleet_lc_17235
+8    web          2 succeeded n1           1 0          /bin/sh -c echo serving; sleep 4 fleet_lc_17235
+9    ssd          1 succeeded n2           1 0          /bin/sh -c echo on an ssd node; sleep 1 fleet_lc_17235
+10   flaky        1 failed    n1           1 2          /bin/sh -c echo about to fail >&2; exit 2 fleet_lc_17235
+11   huge         1 pending   -            0 -          /bin/sh -c echo never placed fleet_lc_17235
+12   long         0 killed    n2           1 -          /bin/sh -c sleep 600 fleet_lc_17235
+outcomes as expected: crunch 6/6 ok, web 3/3 ok, ssd on n2, flaky exit 2, huge pending, long killed
+
+== events (master)
+  16:06:01.905 fleetmaster: task 0 (crunch) placed on n3, attempt 1
+  16:06:01.905 fleetmaster: task 1 (crunch) placed on n3, attempt 1
+  16:06:01.905 fleetmaster: task 2 (crunch) placed on n1, attempt 1
+  16:06:01.905 fleetmaster: task 3 (crunch) placed on n1, attempt 1
+  16:06:01.905 fleetmaster: task 4 (crunch) placed on n1, attempt 1
+  16:06:01.905 fleetmaster: task 5 (crunch) placed on n1, attempt 1
+  16:06:01.933 fleetmaster: task 2 preempted on n1 by task 8
+  16:06:01.933 fleetmaster: task 3 preempted on n1 by task 8
+  16:06:01.933 fleetmaster: task 6 (web) placed on n2, attempt 1
+  16:06:01.933 fleetmaster: task 7 (web) placed on n2, attempt 1
+  16:06:01.933 fleetmaster: task 8 (web) placed on n1, attempt 1
+  16:06:01.933 fleetmaster: task 2 (crunch) placed on n2, attempt 2
+  16:06:01.961 fleetmaster: task 2 preempted on n2 by task 9
+  16:06:01.961 fleetmaster: task 9 (ssd) placed on n2, attempt 1
+  16:06:01.989 fleetmaster: task 10 (flaky) placed on n1, attempt 1
+  16:06:02.046 fleetmaster: task 12 (long) placed on n2, attempt 1
+  16:06:03.114 fleetmaster: killed 1 task(s)
+  16:06:03.144 fleetmaster: drained n3: 2 task(s) back to pending
+  16:06:03.738 fleetmaster: task 0 (crunch) placed on n2, attempt 2
+  16:06:04.240 fleetmaster: task 1 (crunch) placed on n1, attempt 2
+  16:06:04.240 fleetmaster: task 2 (crunch) placed on n1, attempt 3
+  16:06:05.746 fleetmaster: task 3 (crunch) placed on n2, attempt 2
+
+== placement-to-start latency (master 'placed' -> agent 'started', same task and attempt)
+  n=14 (plus 3 placements undone before they started)  min=1 ms  median=277 ms  max=331 ms  (heartbeat interval 500 ms)
+
+== teardown
+no task processes left behind
