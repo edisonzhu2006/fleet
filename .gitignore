@@ -1,0 +1,7 @@
+build/
+build-*/
+.cache/
+compile_commands.json
+.DS_Store
+*.wal
+*.snap
