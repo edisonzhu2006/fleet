@@ -13,18 +13,18 @@ from their last checkpoint, so the job's output is still exactly-once.
 
 ```
             fleetctl (CLI)
-                 |  submit / list / kill / drain
+                 |  gRPC: submit / list / kill / drain
                  v
         +-------------------+      write-ahead log + snapshot
         |  fleetmaster      | ---> (state survives master restart)
         |  scheduler loop   |
         |  reconciler       |
         +-------------------+
-          ^   heartbeats   | assign / stop
+          ^ gRPC heartbeats| gRPC assign / stop
           |   + task state v
    +-----------+  +-----------+  +-----------+
    | fleetlet  |  | fleetlet  |  | fleetlet  |   one per node
-   | runs tasks|  | runs tasks|  | runs tasks|   (real processes)
+   | docker run|  | docker run|  | docker run|   (containers, cgroup limits)
    +-----------+  +-----------+  +-----------+
 ```
 
@@ -39,23 +39,26 @@ if the master dies", and "how did you test that".
   storage, and the resumed job's output is checked against adstack's batch
   oracle. The headline test kills nodes mid-job and still gets identical
   output.
-- **No etcd.** Control-plane durability is a write-ahead log plus periodic
-  snapshot written by fleetmaster itself (fsync + rename, the same
-  technique as streamkit's checkpoints). The interview answer for "why not
-  etcd" is in NOTES.md: one master, no consensus needed for the scope, and
-  building the log is the part worth learning; what etcd/Raft would add
-  (master replication) is stated as the next step.
-- **No gRPC.** A small length-prefixed binary protocol over TCP with POSIX
-  sockets and `poll`. Fewer than ten message types; NOTES.md explains why a
-  framework would be overkill here and what gRPC would buy at scale.
+- **Replicated control plane with its own Raft, not etcd.** fleetmaster
+  runs as 3 replicas that agree on every state change through Raft (leader
+  election, log replication, snapshots), the way Borg's Borgmaster runs 5
+  Paxos-replicated replicas. Losing any one master machine loses nothing.
+  The single-node write-ahead log (m4) becomes the Raft log (m4b).
+- **gRPC + Protocol Buffers** for every interface (agent to master,
+  CLI to master), the same stack Google uses internally. Services and
+  messages are defined in `proto/fleet.proto`.
+- **Docker as the task runtime.** The agent starts each task with
+  `docker run --cpus --memory`, so CPU and memory limits are enforced by
+  Linux cgroups (inside Docker's VM on macOS). A plain-process runtime is
+  kept for unit tests and CI, behind the same `Runtime` interface.
 
 ## Components
 
 | component | what it is |
 |---|---|
-| `proto/` | message structs, encode/decode, length-prefixed framing over TCP |
+| `proto/` | `fleet.proto`: gRPC services (`Master`, `Agent`) and Protobuf messages; CMake generates C++ stubs |
 | `master/` | fleetmaster: cluster state, scheduler, reconciler, failure detector, WAL + snapshot, TCP server |
-| `agent/` | fleetlet: registers with the master, heartbeats, launches tasks as child processes (fork/exec, own process group, rlimits for memory/CPU time), reports exits |
+| `agent/` | fleetlet: registers with the master, heartbeats, runs tasks through a `Runtime` interface: `DockerRuntime` (docker run with --cpus/--memory, cgroup-enforced) or `ProcessRuntime` (fork/exec + rlimits, for tests and CI), reports exits |
 | `ctl/` | fleetctl: submit, list, kill, drain node, show events |
 | `sim/` | in-process simulated cluster (hundreds of fake nodes) for placement and scale tests without real processes |
 | `bench/` | scripts that produce every number in the docs |
@@ -81,9 +84,11 @@ if the master dies", and "how did you test that".
 | m | what | done when |
 |---|---|---|
 | m1 | core model + scheduler as a pure library: nodes, tasks, best-fit placement, quotas, preemption, invariant checker; `sim/` driver | unit tests; sim places 5,000 tasks on 100 nodes with zero overcommit; placement-strategy comparison table |
-| m2 | protocol + fleetmaster + fleetlet over TCP; real processes; heartbeats; fleetctl submit/list/kill | local 3-agent cluster runs real tasks end to end; tests for framing and message round trips |
+| m2 | gRPC services + fleetmaster + fleetlet + fleetctl; ProcessRuntime; heartbeats | local 3-agent cluster runs real tasks end to end over gRPC; integration tests |
+| m2b | DockerRuntime: tasks as containers with cgroup CPU/memory limits; OOM-kill and CPU throttling detected and reported | with Docker installed: a task over its memory limit is OOM-killed and reported, a CPU hog is throttled to its share (measured); without Docker the runtime is skipped cleanly |
 | m3 | failure detection, rescheduling, fencing, drain, restart policies with backoff | `bench/node_failure.sh`: kill an agent with SIGKILL, measure time to detect and to running elsewhere |
 | m4 | WAL + snapshot; master crash recovery with the report-before-schedule rule | `bench/master_failure.sh`: SIGKILL the master mid-workload 20 times; no task lost, none running twice |
+| m4b | Raft-replicated control plane: 3 fleetmaster replicas; leader election, log replication of the m4 WAL records, snapshots/log compaction; agents and fleetctl discover the leader (gRPC redirect); only the leader schedules | `bench/leader_failover.sh`: SIGKILL the leader mid-workload 20 times; a new leader is elected and scheduling resumes, no committed task lost, none running twice; election time median/max; partition test (isolate the leader) shows no split brain |
 | m5 | stateful jobs: run adstack streamkit tasks with checkpoint dirs; on node death the task resumes elsewhere with `--resume` | `bench/stateful_failover.sh`: kill nodes during streamkit jobs; every job's output identical to adstack's oracle |
 | m6 | scale and benchmarks: scheduling latency and throughput in `sim/` at 100 / 1,000 / 10,000 nodes; failover times; BENCHMARKS.md | numbers reproducible from bench scripts |
 
@@ -93,11 +98,11 @@ if the master dies", and "how did you test that".
 2. Every number comes from a script in `bench/`, with machine and load average recorded.
 3. Zero warnings under `-Wall -Wextra -Wpedantic -Wshadow -Wconversion`; ASan clean; TSan clean for anything threaded.
 4. GoogleTest unit tests per milestone.
-5. Plain C++20 and POSIX. No third-party runtime dependencies (GoogleTest for tests only). adstack is used as an external binary in m5, not linked.
+5. C++20, gRPC and Protocol Buffers (found via CMake `find_package`; on Edison's Mac they come from `~/anaconda3`), Docker CLI at runtime for DockerRuntime. GoogleTest for tests. adstack is used as an external binary in m5, not linked.
 6. Long-running commands print progress at least every 30 seconds or run in the background, so automated sessions do not stall.
 
 ## Resume target (numbers filled in from BENCHMARKS.md at the end)
 
-**fleet: Cluster Scheduler for Stateful Jobs** | C++20, Distributed Systems, TCP/POSIX, CMake
+**fleet: Distributed Cluster Scheduler** | C++20, gRPC, Protocol Buffers, Docker, Raft
 - Built a Borg-style scheduler that places jobs across machines by CPU and memory, preempts low-priority work, and reschedules jobs when a machine fails
-- Restarts streaming jobs on a new machine from their last checkpoint after a crash, with output verified identical across N forced node failures
+- Replicates the scheduler across 3 nodes with Raft so it survives losing its leader, and restarts streaming jobs from their last checkpoint after machine failures with output verified identical across N forced crashes
