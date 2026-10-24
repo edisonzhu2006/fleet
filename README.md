@@ -5,7 +5,7 @@ plane places tasks on nodes by CPU and memory, preempts lower-priority
 work, and when a node dies reschedules its tasks elsewhere, resuming
 streaming jobs from their last checkpoint.
 
-Status: m3 done. m1: core model and scheduler as a pure library,
+Status: m4 done. m1: core model and scheduler as a pure library,
 `fleetsim` simulator, placement-strategy comparison. m2: gRPC control
 plane (`proto/fleet.proto`), `fleetmaster`, `fleetlet` agents with a
 fork/exec `ProcessRuntime`, the `fleetctl` CLI, and a local 3-agent
@@ -22,16 +22,30 @@ always) with capped exponential backoff, graceful drain (stop, then move),
 and cleanup of tasks a crashed fleetlet left behind; measured with
 `bench/node_failure.sh` (SIGKILL an agent, 10 trials: declared dead in
 a median 2,771 ms, max 2,950 ms; all four of its tasks running elsewhere
-in a median 3,107 ms, max 3,440 ms; both follow from 500 ms heartbeats
-and 6 missed beats, as NOTES.md explains). Decisions and measurements are in
-[NOTES.md](NOTES.md). m4 (write-ahead log, master crash recovery) is
-next. See [docs/PLAN.md](docs/PLAN.md).
+in a median 3,107 ms, max 3,440 ms). m4: the master survives its own
+crash. Every state change is a Protobuf record (`proto/wal.proto`) in a
+length-prefixed, CRC-32C-checksummed write-ahead log, synced with
+F_FULLFSYNC before any reply that depends on it leaves the process, one
+sync per scheduler iteration or RPC (group commit: 1,000 placements commit
+in about 3 ms instead of about 3.1 s with a sync per record); snapshots
+with log rotation; recovery is snapshot plus replay with a torn tail
+discarded, then report-before-schedule and reconciliation against the
+agents' first reports. `bench/master_failure.sh` SIGKILLs the master 20
+times mid-workload: no acknowledged task lost, no task ever running twice
+at once, every agent keeps its registration; the master serves RPCs again
+about 30 ms after the kill and is scheduling again, once every agent has
+reported, a median of 241 ms and 340 ms after it in two runs of 20 (max
+525 ms; NOTES.md).
+Decisions and measurements are in [NOTES.md](NOTES.md). m4b (Raft
+replication of the same log) is next. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Run a local cluster
 
 ```
 bench/local_cluster.sh      # master + 3 agents, a mix of real tasks, clean teardown
 bench/node_failure.sh       # SIGKILL an agent 10 times: time to dead, time to running elsewhere
+bench/master_failure.sh     # SIGKILL the master 20 times mid-workload: nothing lost, nothing doubled
+bench/wal_commit.sh         # sync latency, group commit vs per-record sync, replay vs snapshot
 ```
 
 Or by hand:
@@ -45,6 +59,22 @@ Or by hand:
 ./build/bin/fleetctl kill --job hello
 ./build/bin/fleetctl drain n1     # no new tasks on n1; each of its tasks is stopped, then moved
 ```
+
+To keep the master's state across restarts, give it a state directory:
+
+```
+./build/bin/fleetmaster --listen 127.0.0.1:7070 --state-dir /private/tmp/fleet/state &
+```
+
+It writes `wal` (the log) and `snapshot` there, and on start rebuilds its
+state from them before it opens the port. Agents need no change: their
+next heartbeat to the restarted master is accepted under the same epoch.
+`--wal-sync full|fsync|none` (default full: F_FULLFSYNC on macOS),
+`--wal-per-record` (one sync per record, for comparison),
+`--snapshot-every N` (records between snapshots, default 10000) and
+`--recovery-window-ms N` (longest wait for agents to report after a
+restart, default 1000) tune it. Without `--state-dir` the master keeps
+state in memory only, as before m4.
 
 Failure handling is set on the master: `--heartbeat-ms 500 --suspect-after 3
 --dead-after 6 --tick-ms 100` (the defaults) and, for restart policies,

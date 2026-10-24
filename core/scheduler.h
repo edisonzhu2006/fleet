@@ -85,6 +85,25 @@ struct ScheduleResult {
   std::vector<int64_t> decision_ns;  // only if options.record_latency
 };
 
+// How a scheduling pass changes state (m4). The scheduler only decides;
+// an Actuator carries each decision out, in the order it was made. The
+// default one (used by the simulator and the m1 tests) calls ClusterState
+// directly. The master supplies its own, which turns each decision into a
+// write-ahead-log record and applies it through the same
+// MasterState::apply() that recovery replays, so a placement made live and
+// a placement replayed from the log run the same code.
+//
+// The pass reads the ClusterState it was given between decisions, so an
+// Actuator must apply each decision to that same ClusterState before
+// returning. Both methods return false if the transition was refused,
+// which for a scheduler-made decision is a bug.
+class Actuator {
+ public:
+  virtual ~Actuator() = default;
+  virtual bool place(TaskId task, NodeId node) = 0;
+  virtual bool evict(TaskId task) = 0;
+};
+
 class Scheduler {
  public:
   explicit Scheduler(SchedulerOptions options = {}) : options_(options) {}
@@ -92,6 +111,9 @@ class Scheduler {
   // One pass over the pending queue. Mutates state through its public
   // transitions only (place / evict), so invariants are enforced there.
   ScheduleResult schedule_pending(ClusterState& state) const;
+  // The same pass, with every decision carried out by `act`, which must
+  // apply it to `state` (see Actuator).
+  ScheduleResult schedule_pending(const ClusterState& state, Actuator& act) const;
 
   // Step 1 + 2 for a single task: the chosen feasible node, or nullopt.
   std::optional<NodeId> pick_node(const ClusterState& state,

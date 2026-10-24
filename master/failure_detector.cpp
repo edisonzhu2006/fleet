@@ -24,9 +24,9 @@ FailureDetector::FailureDetector(FailureDetectorOptions options) : options_(opti
   }
 }
 
-void FailureDetector::reset(NodeId node, Clock::time_point now) {
+void FailureDetector::reset(NodeId node, Clock::time_point now, Health initial) {
   if (node >= nodes_.size()) nodes_.resize(node + 1);
-  nodes_[node] = Entry{Health::kAlive, now};
+  nodes_[node] = Entry{initial, now};
 }
 
 uint32_t FailureDetector::missed(NodeId node, Clock::time_point now) const {

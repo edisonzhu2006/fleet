@@ -237,7 +237,27 @@ std::optional<PreemptionPlan> Scheduler::plan_preemption(
   return plan;
 }
 
+namespace {
+
+// The Actuator for callers that own the ClusterState outright.
+class DirectActuator final : public Actuator {
+ public:
+  explicit DirectActuator(ClusterState& s) : s_(s) {}
+  bool place(TaskId task, NodeId node) override { return s_.place(task, node); }
+  bool evict(TaskId task) override { return s_.evict(task); }
+
+ private:
+  ClusterState& s_;
+};
+
+}  // namespace
+
 ScheduleResult Scheduler::schedule_pending(ClusterState& state) const {
+  DirectActuator act(state);
+  return schedule_pending(state, act);
+}
+
+ScheduleResult Scheduler::schedule_pending(const ClusterState& state, Actuator& act) const {
   using Clock = std::chrono::steady_clock;
   ScheduleResult result;
   // Walk the pending queue by key rather than by iterator: placing a task
@@ -260,20 +280,20 @@ ScheduleResult Scheduler::schedule_pending(ClusterState& state) const {
     ++result.decisions;
 
     if (auto node = pick_node(state, task)) {
-      state.place(task.id, *node);
+      act.place(task.id, *node);
       result.placements.push_back({task.id, *node});
     } else if (auto plan = options_.enable_preemption
                                ? plan_preemption(state, task)
                                : std::nullopt) {
       if (!plan->exhaustive) ++result.truncated_searches;
       for (TaskId v : plan->victims) {
-        state.evict(v);
+        act.evict(v);
         result.preemptions.push_back({v, task.id, plan->node});
       }
       // Cannot fail: the plan freed at least the deficit on a ready node
       // whose labels match. A false here would be a scheduler bug, and the
       // invariant checker in tests would report the task still pending.
-      state.place(task.id, plan->node);
+      act.place(task.id, plan->node);
       result.placements.push_back({task.id, plan->node});
     } else {
       ++result.unschedulable;

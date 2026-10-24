@@ -1,7 +1,13 @@
 // fleetmaster: the control plane binary. Parses flags, starts a
 // MasterServer, and shuts it down cleanly on SIGINT or SIGTERM. All logic
-// is in fleet_master_lib (master_core, master_server, failure_detector) so
-// the integration tests run exactly the same code in-process.
+// is in fleet_master_lib (master_core, master_server, failure_detector,
+// and from m4 master_state and wal) so the integration tests run exactly
+// the same code in-process.
+//
+// With --state-dir (m4) the master keeps a write-ahead log and snapshots
+// there and recovers from them on start; nothing special happens at
+// shutdown, because every change is already durable when its RPC returns.
+// A SIGKILL and a clean stop leave the same files.
 
 #include <csignal>
 #include <cstdio>
@@ -22,8 +28,13 @@ void usage() {
                "                   [--suspect-after MISSED] [--dead-after MISSED]\n"
                "                   [--backoff-base-ms N] [--backoff-max-ms N] [--backoff-reset-ms N]\n"
                "                   [--strategy best-fit|worst-fit|first-fit] [--no-preempt] [--quiet]\n"
+               "                   [--state-dir DIR] [--wal-sync full|fsync|none] [--wal-per-record]\n"
+               "                   [--snapshot-every RECORDS] [--recovery-window-ms N]\n"
                "  defaults: tick 100, heartbeat 500, suspect after 3 missed, dead after 6,\n"
-               "            backoff 1000 doubling to 60000, reset after 60000 ms up\n");
+               "            backoff 1000 doubling to 60000, reset after 60000 ms up;\n"
+               "            no state dir (state is lost on exit); with one: wal-sync full\n"
+               "            (F_FULLFSYNC on macOS), one sync per batch, snapshot every 10000\n"
+               "            records, recovery window 1000 ms\n");
 }
 
 // Integer flag in [lo, hi]; exits with usage on anything else, so a typo
@@ -80,6 +91,26 @@ int main(int argc, char** argv) {
       opt.core.scheduler.enable_preemption = false;
     } else if (a == "--quiet") {
       opt.core.log_events = false;
+    } else if (a == "--state-dir") {
+      opt.state_dir = next();
+    } else if (a == "--wal-sync") {
+      const std::string m = next();
+      if (m == "full") {
+        opt.storage.sync = fleet::SyncMode::kFull;
+      } else if (m == "fsync") {
+        opt.storage.sync = fleet::SyncMode::kFsync;
+      } else if (m == "none") {
+        opt.storage.sync = fleet::SyncMode::kNone;
+      } else {
+        usage();
+        return 2;
+      }
+    } else if (a == "--wal-per-record") {
+      opt.storage.policy = fleet::SyncPolicy::kPerRecord;
+    } else if (a == "--snapshot-every") {
+      opt.storage.snapshot_every = static_cast<uint64_t>(parse_int(next(), 0, 1'000'000'000));
+    } else if (a == "--recovery-window-ms") {
+      opt.core.recovery_window = std::chrono::milliseconds(parse_int(next(), 0, 600000));
     } else {
       usage();
       return 2;

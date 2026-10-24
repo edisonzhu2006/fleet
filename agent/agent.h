@@ -35,6 +35,7 @@
 #include <compare>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -62,6 +63,14 @@ struct AgentOptions {
   // How often exits are collected between heartbeats.
   std::chrono::milliseconds poll_interval{20};
   bool log_events = false;
+  // Optional machine-readable record of every task instance's lifetime
+  // (m4, for bench/master_failure.sh): one line per event,
+  //     <unix microseconds> start|exit <task> <attempt> <epoch> <node name>
+  // "start" is stamped just before the runtime is asked to start it and
+  // "exit" once the agent has seen it gone, so each [start, exit] interval
+  // contains the process's real lifetime. If two such intervals of one
+  // task do not overlap, the processes did not run at the same time.
+  std::filesystem::path event_log;
 };
 
 class Agent {
@@ -124,6 +133,11 @@ class Agent {
   void launch(const v1::TaskLaunch& l);
   void publish_stats();
   void log(const std::string& line) const;
+  // Appends one line to options_.event_log (if set), stamped `when`.
+  void record_event(const char* what, const Key& key,
+                    std::chrono::system_clock::time_point when);
+  // kill_all() plus an exit event for every instance it took down.
+  void kill_everything();
   static Key key_of(const v1::TaskInstance& inst);
 
   AgentOptions options_;
@@ -131,6 +145,7 @@ class Agent {
   std::unique_ptr<v1::Master::Stub> stub_;
 
   // Loop-thread state (no lock needed).
+  std::FILE* events_ = nullptr;  // options_.event_log, opened by run()
   bool registered_ = false;
   uint32_t node_id_ = 0;
   uint64_t epoch_ = 0;

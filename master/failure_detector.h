@@ -79,7 +79,10 @@ class FailureDetector {
 
   // A node registered (new, or a known node registering again): alive and
   // heard from now. Grows the table when `node` is new; ids are dense.
-  void reset(NodeId node, Clock::time_point now);
+  // `initial` is for a master restarted from its log (m4): a node that was
+  // dead stays dead, and one that has not reported since the restart
+  // starts suspect, with its silence counted from `now`.
+  void reset(NodeId node, Clock::time_point now, Health initial = Health::kAlive);
 
   // A heartbeat that MasterCore accepted (current epoch) arrived. Returns
   // the change if it cleared suspicion (suspect -> alive). A dead node

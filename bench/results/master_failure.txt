@@ -1,0 +1,93 @@
+### run 1: bench/master_failure.sh
+== machine: Apple M5 Pro, load: 2.10 2.85 2.69
+  submitted job svc: 0 1 2 3
+
+== 20 SIGKILL trials (master restarted at once each time)
+  trial      lsn kill->serving  kill->schedule       window  recovered from
+  1           39         30 ms          131 ms       102 ms  no snapshot, replayed 39, skipped 0, torn 0 B
+  2           77         30 ms          183 ms       153 ms  no snapshot, replayed 77, skipped 0, torn 0 B
+  3          114         24 ms           40 ms        17 ms  no snapshot, replayed 114, skipped 0, torn 0 B
+  4          160         29 ms          158 ms       129 ms  no snapshot, replayed 160, skipped 0, torn 0 B
+  5          193         28 ms           69 ms        42 ms  no snapshot, replayed 193, skipped 0, torn 0 B
+  6          241         30 ms          103 ms        74 ms  snapshot at lsn 201, replayed 40, skipped 0, torn 0 B
+  7          287         30 ms          191 ms       161 ms  snapshot at lsn 201, replayed 86, skipped 0, torn 0 B
+  8          326         24 ms          254 ms       231 ms  snapshot at lsn 201, replayed 125, skipped 0, torn 0 B
+  9          352         30 ms          299 ms       269 ms  snapshot at lsn 201, replayed 151, skipped 0, torn 0 B
+  10         372         29 ms          283 ms       254 ms  snapshot at lsn 201, replayed 171, skipped 0, torn 0 B
+  11         397         30 ms          509 ms       480 ms  snapshot at lsn 201, replayed 196, skipped 0, torn 0 B
+  12         439         26 ms          454 ms       428 ms  snapshot at lsn 402, replayed 37, skipped 0, torn 0 B
+  13         480         31 ms          185 ms       154 ms  snapshot at lsn 402, replayed 78, skipped 0, torn 0 B
+  14         505         26 ms          292 ms       266 ms  snapshot at lsn 402, replayed 103, skipped 0, torn 0 B
+  15         547         32 ms          305 ms       274 ms  snapshot at lsn 402, replayed 145, skipped 0, torn 0 B
+  16         581         26 ms          525 ms       500 ms  snapshot at lsn 402, replayed 179, skipped 0, torn 0 B
+  17         621         28 ms          228 ms       200 ms  snapshot at lsn 602, replayed 19, skipped 0, torn 0 B
+  18         665         28 ms          382 ms       354 ms  snapshot at lsn 602, replayed 63, skipped 0, torn 0 B
+  19         696         31 ms          293 ms       263 ms  snapshot at lsn 602, replayed 94, skipped 0, torn 0 B
+  20         733         31 ms          192 ms       161 ms  snapshot at lsn 602, replayed 131, skipped 0, torn 0 B
+
+== stopping the client; waiting for every acknowledged task to finish
+
+== summary over 20 master SIGKILLs
+  kill -> serving RPCs           min    24  median    29  max    32 ms
+  kill -> scheduling (recovered) min    40  median   241  max   525 ms
+  report window                  min    17  median   215  max   500 ms
+  snapshots written during the run: 3
+  batch tasks acknowledged to the client: 266 (submissions refused while the master was down: 4)
+  batch tasks the master has: 266 (any above 266 were committed, then the master died before replying)
+  lost (acknowledged but not succeeded): 0
+  services still running at attempt 1: 4 of 4
+  placed before a crash but never started (requeued at the node's first report): 38
+  tasks with event-log instances: 270, instances: 270, tasks started more than once: 0
+  overlapping instances of one task: 0
+  agents fenced: 0, nodes re-registered: 0
+  PASS: no task lost, none ran twice concurrently
+
+== teardown
+no task processes left behind
+
+### run 2: bench/master_failure.sh
+== machine: Apple M5 Pro, load: 2.27 2.74 2.66
+  submitted job svc: 0 1 2 3
+
+== 20 SIGKILL trials (master restarted at once each time)
+  trial      lsn kill->serving  kill->schedule       window  recovered from
+  1           63         24 ms          487 ms       464 ms  no snapshot, replayed 63, skipped 0, torn 0 B
+  2          106         27 ms          223 ms       196 ms  no snapshot, replayed 106, skipped 0, torn 0 B
+  3          155         25 ms           53 ms        28 ms  no snapshot, replayed 155, skipped 0, torn 0 B
+  4          190         31 ms          365 ms       334 ms  no snapshot, replayed 190, skipped 0, torn 0 B
+  5          213         25 ms          316 ms       292 ms  snapshot at lsn 200, replayed 13, skipped 0, torn 0 B
+  6          243         22 ms           44 ms        23 ms  snapshot at lsn 200, replayed 43, skipped 0, torn 0 B
+  7          290         26 ms          450 ms       424 ms  snapshot at lsn 200, replayed 90, skipped 0, torn 0 B
+  8          332         31 ms          478 ms       448 ms  snapshot at lsn 200, replayed 132, skipped 0, torn 0 B
+  9          370         24 ms          300 ms       276 ms  snapshot at lsn 200, replayed 170, skipped 0, torn 0 B
+  10         416         32 ms          191 ms       160 ms  snapshot at lsn 400, replayed 16, skipped 0, torn 0 B
+  11         450         30 ms          419 ms       390 ms  snapshot at lsn 400, replayed 50, skipped 0, torn 0 B
+  12         495         29 ms          128 ms        99 ms  snapshot at lsn 400, replayed 95, skipped 0, torn 0 B
+  13         539         29 ms          480 ms       451 ms  snapshot at lsn 400, replayed 139, skipped 0, torn 0 B
+  14         584         28 ms          379 ms       351 ms  snapshot at lsn 400, replayed 184, skipped 0, torn 0 B
+  15         628         29 ms          422 ms       393 ms  snapshot at lsn 601, replayed 27, skipped 0, torn 0 B
+  16         661         25 ms          488 ms       464 ms  snapshot at lsn 601, replayed 60, skipped 0, torn 0 B
+  17         690         29 ms          222 ms       194 ms  snapshot at lsn 601, replayed 89, skipped 0, torn 0 B
+  18         741         25 ms          484 ms       460 ms  snapshot at lsn 601, replayed 140, skipped 0, torn 0 B
+  19         788         29 ms          160 ms       131 ms  snapshot at lsn 601, replayed 187, skipped 0, torn 0 B
+  20         834         31 ms          173 ms       143 ms  snapshot at lsn 804, replayed 30, skipped 0, torn 0 B
+
+== stopping the client; waiting for every acknowledged task to finish
+
+== summary over 20 master SIGKILLs
+  kill -> serving RPCs           min    22  median    28  max    32 ms
+  kill -> scheduling (recovered) min    44  median   340  max   488 ms
+  report window                  min    23  median   313  max   464 ms
+  snapshots written during the run: 4
+  batch tasks acknowledged to the client: 312 (submissions refused while the master was down: 3)
+  batch tasks the master has: 312 (any above 312 were committed, then the master died before replying)
+  lost (acknowledged but not succeeded): 0
+  services still running at attempt 1: 4 of 4
+  placed before a crash but never started (requeued at the node's first report): 30
+  tasks with event-log instances: 316, instances: 316, tasks started more than once: 0
+  overlapping instances of one task: 0
+  agents fenced: 0, nodes re-registered: 0
+  PASS: no task lost, none ran twice concurrently
+
+== teardown
+no task processes left behind

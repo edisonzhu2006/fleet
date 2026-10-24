@@ -1145,3 +1145,442 @@ Zero warnings in project code (clean Release rebuild, `cmake --build
 build --clean-first`; the one warning is `-Wcharacter-conversion` inside
 GoogleTest's own gtest-printers.h, not compiled with fleet_flags; the
 ASan and TSan rebuilds printed none).
+
+## 2026-10-24: m4, write-ahead log, snapshots, single-master crash recovery
+
+What was built:
+- `proto/wal.proto`: the master's storage format, separate from the RPC
+  contract in `fleet.proto`. `WalRecord` (an LSN plus one of 11 ops:
+  `NodeRegistered`, `NodeDied`, `NodeDraining`, `TasksSubmitted`,
+  `TaskPlaced`, `TaskPreempted`, `TaskRequeued`, `TaskMoving`,
+  `TaskExited`, `TaskBackoffOver`, `TaskKilled`) and `Snapshot`.
+- `master/master_state.{h,cpp}`: `MasterState`, everything the master must
+  not forget (ClusterState plus node names, epochs, drain flags, each
+  task's command line, attempt, restart counters, backoff deadline and
+  last exit, the epoch counter, the LSN), and the single function that
+  changes it, `apply(record)`. Snapshots in and out.
+- `master/wal.{h,cpp}`: `Storage`. Length-prefixed, CRC-32C-checksummed
+  frames, appends synced with `F_FULLFSYNC`, group commit, snapshot and
+  log rotation, recovery (snapshot plus replay, torn tail cut off,
+  corruption refused).
+- `MasterCore` rewritten so it never changes durable state directly: every
+  decision becomes a record, applied through `MasterState::apply` and
+  queued (`take_records()`). The scheduler got an `Actuator` interface so
+  its placements and evictions go through the same path. A second
+  constructor starts a core from a recovered state in a report window.
+- `MasterServer`: recovery before the port opens; `commit_locked()` after
+  every RPC and every tick, before the lock is released; snapshots when
+  due; abort on any disk error.
+- `fleetmaster --state-dir --wal-sync full|fsync|none --wal-per-record
+  --snapshot-every --recovery-window-ms`.
+- Agent: `--event-log FILE`, a timestamped start/exit line per task
+  instance, used by the overlap check.
+- `master/walbench.cpp` + `bench/wal_commit.sh`; `bench/master_failure.sh`.
+  Output in `bench/results/wal_commit.txt` and
+  `bench/results/master_failure.txt`.
+
+**Log decisions, not inputs (a state-machine command log).** A record is
+something the master already decided: "task 7 placed on node 2 as
+attempt 3 at T", "task 4 exited 1 and backs off until T+2000". It is never
+an input the master still has to decide about ("node 2 heartbeat at t").
+So `apply()` needs no clock, no scheduler, no failure detector and no
+randomness, and it never iterates over an unordered container. The same
+records applied to the same state always give the same state. Recovery
+needs that, and so does m4b: Raft followers apply the leader's records,
+and they must end up with the leader's state. Alternatives: (1) log the
+inputs (every RPC request and tick time) and replay them through the
+whole master. That is deterministic only if the scheduler, the failure
+detector and the backoff math are too, and it would log one record per
+heartbeat, i.e. 2 per node per second even when nothing changes. Any
+change to the scheduler would also change what an old log replays to.
+(2) Dump the whole state on every change: simple, but each write is
+O(state) instead of O(change). Cost of the choice: everything decided
+from time or policy has to travel in the record (`restart_at_ms`,
+`consecutive_restarts`, `attempt`, `epoch`, `placed_at_ms`), and MasterCore
+had to be rewritten so every mutation goes through `emit()`.
+
+**One apply path, used live and on replay.** `emit()` applies the record
+to the live state with the same `MasterState::apply` that recovery runs,
+then queues it. There is no second "replay version" of any transition to
+drift from the live one. A record the live state refuses throws: it is a
+MasterCore bug, and running on a state the log cannot reproduce would be
+worse. `apply()` also checks that each record follows the last LSN and
+that a placement's attempt is the previous one plus 1. So a log applied
+to the wrong snapshot, or with a hole in it, fails loudly instead of
+quietly giving a different state. The randomized test below proves the
+property.
+
+**The ordering rule: durable before visible.** Every call runs as: lock,
+decide and apply in memory, append that call's records and sync, unlock,
+reply. The tick thread does the same. So when the lock is released,
+everything in memory is on disk, and no reply, start, stop, forget, epoch
+or submission ack leaves the process before the change behind it is
+durable. A crash at any instant is then safe in both directions. A change
+that was not synced was never seen by anyone, so losing it is as if it
+never happened, and the master re-decides it. A change anyone has seen
+survives. Concretely, what goes wrong without the rule (reply first, log
+later):
+- a forgotten exit: the agent drops an exit once the master acks it, and
+  if the ack goes out before the `TaskExited` record is durable, a crash
+  loses the exit for good, so the task "runs" forever;
+- a reissued epoch: a node holds epoch E while a restarted master issues
+  E again to another registration;
+- a double start: a start goes out for attempt 3 on node A, the record is
+  lost, and the restarted master places attempt 3 again on node B.
+`Recovery.AnExitLostWithAnUncommittedBatchIsReportedAgainAndAppliedOnce`
+shows the first case handled correctly. The cost: the master's lock is
+held across the sync. At about 3 ms per `F_FULLFSYNC` that caps commits
+at about 330 per second, and every RPC (reads included) waits behind a
+sync in progress. Group commit (below) makes each sync cover a whole
+scheduling pass, so the cap is on commits, not records: one pass placing
+1,000 tasks is one sync. The alternative, for m4b: decide under the lock,
+release it, sync off the lock, and hold each reply until the durable LSN
+reaches the LSN its decisions produced. That is exactly Raft's commit
+index, so it lands with m4b rather than being built twice.
+
+**`F_FULLFSYNC` on macOS, `fdatasync` elsewhere.** On macOS `fsync()`
+hands the data to the drive but does not make the drive flush its own
+write cache, so a power cut can still lose it. Apple's fsync(2) man page
+says so and points to `fcntl(F_FULLFSYNC)`. Measured here (table below):
+p50 3.005 ms for `F_FULLFSYNC` against 0.021 ms for plain `fsync`, about
+140 times slower, and that ratio is the whole reason for group commit.
+On Linux `fdatasync` already flushes the device cache and skips metadata
+the data does not need (it still writes the file size an append
+changes). If a file system refuses `F_FULLFSYNC` (some network or FUSE
+mounts), the master falls back to `fsync` rather than refusing to run.
+`--wal-sync fsync|none` trade power-loss safety for speed; even `none`
+survives a process crash such as SIGKILL, because the page cache
+outlives the process. On any sync failure the master aborts and does not
+retry: after a failed fsync the kernel may already have dropped the dirty
+pages and marked them clean, so a later successful fsync proves nothing
+(PostgreSQL's 2018 "fsyncgate"). The next start recovers from whatever
+the disk really holds.
+
+**Group commit per call (one scheduler iteration, or one RPC), measured
+against a sync per record.** One `append()` per call writes all of that
+call's frames with one `write()` and one sync. `walbench` timed one
+scheduling pass on 100 nodes placing K tasks (real MasterCore, real
+Storage, F_FULLFSYNC):
+
+| K placements | group: syncs, commit ms | per-record: syncs, commit ms | speedup |
+|---|---|---|---|
+| 1 | 1, 2.89 | 1, 2.95 | 1x |
+| 10 | 1, 3.94 | 10, 30.97 | 8x |
+| 100 | 1, 2.86 | 100, 306.16 | 107x |
+| 1,000 | 1, 3.17 | 1,000, 3,096.56 | 977x |
+
+The group commit time stays flat at about 3 ms: the sync dominates, not
+the 26 KB written for 1,000 records. With a sync per record it grows
+linearly at about 3.1 ms per record, i.e. about 323 records per second no
+matter how big the batch. Per-call batching is safe because a reply
+depends only on its own call's records and everything before them. It
+also costs no added latency, unlike a timer-based group commit (gather
+for N ms, then sync), which only pays off when many independent callers
+each commit small batches at once. Under the master's single lock, calls
+are serial anyway.
+
+**Frame = `[u32 length][u32 CRC-32C(length ++ payload)][Protobuf
+payload]`.** The length lets a reader find record boundaries. The checksum
+tells a completely written record from one torn by a crash or rotted on
+disk. It covers the length too, so a corrupted length cannot make a wrong
+span of bytes look valid. CRC-32C (Castagnoli) is what ext4, iSCSI,
+LevelDB and RocksDB use: better error detection than zlib's CRC-32 for
+the same cost, and a 256-entry table is small enough to write here
+instead of adding a dependency. Why Protobuf payloads rather than a
+hand-rolled binary layout: field numbers give forward and backward
+compatibility (a master must read logs its previous version wrote), and
+the records are already Protobuf-shaped for m4b's Raft RPCs. The cost is
+about 21 to 27 bytes per `TaskPlaced` (header included), which does not
+matter next to a 3 ms sync.
+
+**The torn-tail rule: a bad frame followed only by zeros or EOF is torn;
+anything else is corruption, and the master refuses to start.** A crash
+mid-append leaves a prefix of the last batch, plus zero-filled space on
+some file systems. That batch was never synced, so nobody acted on it,
+and recovery truncates it and carries on. A bad frame with valid-looking
+data after it means damage in the middle of the log. Skipping it would
+silently drop acknowledged records, so the master stops, names the
+offset, and leaves the file untouched for a human. A frame whose checksum
+matches but which does not parse is also refused: those are the bytes
+that were written, from a newer or broken writer, not a tear. A length
+above 1 GiB in a complete header is refused as damage even at the end,
+because a torn write leaves a correct prefix and never invents such a
+length. The rule gets two cases wrong:
+- a power cut can persist the pages of the last unsynced batch out of
+  order, leaving a garbage page with good data after it. That is refused
+  although it is really a tear: the safe direction, it needs a human, and
+  nothing is lost;
+- a length in the middle of the log corrupted to point past the end of
+  the file looks exactly like a tear, so the records after it would be
+  dropped. That is the unsafe direction. A separate checksum over the
+  8-byte header would close it, at 4 bytes per record. It was left out
+  because bit rot in an fsynced file on APFS is rare and m4b removes the
+  single copy: a replica with a damaged log can catch up from the leader.
+
+**Snapshot: primary state only, written to a temp file, synced, renamed,
+directory synced, then the log rotated.** A snapshot holds only primary
+state. Everything derived (node allocations, the pending queue, per-node
+task sets, quota usage, the backoff timer set) is rebuilt on load by
+`ClusterState::restore_node/restore_task` and then verified with
+`check_invariants()`, so a snapshot that does not rebuild cleanly is
+refused. Storing derived state too would mean two copies that can
+disagree. The steps: write `snapshot.tmp`, sync it, rename it over
+`snapshot`, sync the directory (a rename is a directory change and is not
+durable until the directory is synced), then rotate: an empty synced
+`wal.next` is renamed over `wal` and the directory is synced again. Every
+crash point recovers. Before the first rename there is the old snapshot
+and the full log. After it there is the new snapshot and the old log,
+whose records at or below the snapshot's LSN replay skips
+(`Snapshot.CrashBetweenSnapshotAndRotationSkipsRecordsAlreadyIn`).
+Leftover temp files are deleted at start and never read. A snapshot is
+taken every `--snapshot-every` records (default 10,000); recovery counts
+the replayed tail toward it, so a master that keeps crashing still
+rotates. Measured in the master_failure run: 13.1 to 17.0 ms per
+snapshot (four full syncs dominate), under the lock. Alternatives: a
+fuzzy snapshot built while the lock is released, or Redis-style fork and
+copy-on-write. Both avoid the pause, but at this state size the pause is
+a few syncs, so neither earns its complexity yet.
+
+What snapshots buy here is honest to state: they bound the log's size
+more than its replay time. `walbench` replayed 100,150 records (50,000
+tasks) in 20.1 ms (0.20 us per record), and loading a snapshot of the
+same state took 17.8 ms. Both are dominated by state size, because fleet
+never forgets a task: terminal tasks stay in the state, so the snapshot
+grows with history too (2.05 MB against the log's 2.59 MB). Garbage-
+collecting terminal tasks after a retention period is what would make
+snapshots pay off in time as well; it is left for m6's scale work.
+
+**Wall-clock milliseconds in records, steady clock for heartbeats.** The
+master measures silence with the steady clock, which never steps. But a
+steady clock's zero is arbitrary per boot (and per machine, for m4b), so
+a steady time written before a crash means nothing after it. Durable
+times (backoff deadlines, placement times) are therefore wall-clock
+milliseconds, converted with one offset measured when the core is built.
+Cost: if the wall clock steps across a restart, a backoff ends early or
+late by the step. That is a timing effect, never a safety one. Epochs,
+which are the safety-critical counter, no longer depend on the clock
+since m4: `NodeRegistered` carries the epoch and replay moves the counter
+past it, so a restarted master keeps issuing larger ones. The m3 clock
+seed (microseconds since 1970) remains only as a floor for a master whose
+state directory was lost.
+
+**Report before schedule: the restarted master waits for every live node
+to report (or up to `--recovery-window-ms`, default 1,000) before its
+first scheduling pass.** After a restart the log knows what the master
+decided, but not what happened while it was down: placements whose start
+never reached the agent (38 in the first master_failure run, 30 in the
+second), tasks that exited during the outage and still hold their
+resources, and nodes that died. A pass run on that view would place,
+preempt or call things unschedulable on the strength of phantom
+allocations. Also, every node that has not reported yet is suspect (it
+keeps its tasks but gets no new ones), so an early pass would herd all
+the pending work onto whichever node reported first. So the core accepts
+heartbeats and applies what they report, but schedules nothing until
+every node that is not dead has reported once. It ends the window early
+the moment the last one does: in the master_failure runs the window was
+a median 215 ms and 313 ms against the 1,000 ms limit. The default is
+two heartbeat intervals because an agent whose channel is in gRPC's
+reconnect backoff (capped at 1 s, agent.cpp) can need about that long to
+get its first beat through. A node that misses the window stays suspect
+and rejoins on its first heartbeat
+(`Recovery.ALateNodeStaysSuspectAfterTheWindowThenRejoins`). The failure
+detector's clocks are reset at the restart, so no node is declared dead
+for silence that happened while the master was down; one that never
+reports is declared dead on the usual 3 s, counted from the restart. Cost:
+up to the window of no scheduling after each restart, and a node that
+died during the outage is detected 3 s after the restart rather than at
+once. Mesos does the same thing at a larger scale: after a master
+failover it waits, up to an agent re-registration timeout, for agents to
+re-register and report their tasks, then reconciles.
+
+**Reconcile at each node's first report: unreported tasks go back to
+pending at a new attempt; unknown instances are stopped.** A task the log
+has running on a node that the node does not report never got its start.
+The agent applies each reply before it sends its next heartbeat, so if
+the reply carrying the start had arrived, this report would list the
+task, running or exited. That inference is what makes the requeue safe
+even though the log says the task was placed. Requeue rather than re-send
+the start: re-sending would also work, and would keep the task on the
+same node. But a requeue gives the scheduler a fresh decision against the
+cluster as it now is, and a new attempt number. Then if the old attempt
+ever did start, through some path this argument missed, it is a
+non-current instance and gets stopped, never mistaken for the new one.
+The cost is an attempt-counter bump for those tasks, and occasionally a
+move to another node. An instance a node runs that the log does not know
+(an attempt the log never made, a task id it never issued) is told to
+stop, by the same "not current" rule as any stale instance. Agents do not
+re-register after a master restart: their epochs are in the log, so their
+next heartbeat is simply accepted, and the services survive untouched (4
+of 4 still at attempt 1 after 20 kills).
+
+**How "none ran twice concurrently" is checked.** Each fleetlet logs one
+line per instance event (`--event-log`). "start" is stamped just before
+the runtime is asked to start the process, and "exit" once the agent has
+seen it gone, so each [start, exit] interval contains the process's real
+lifetime. That makes the check conservative: if two intervals of one
+task do not overlap, the processes did not overlap either. The bench
+sorts each task's instances across all agents' logs by start and requires
+every start to be at or after the previous instance's exit. Clock: all
+agents run on one machine and use the same wall clock, so their stamps
+are comparable. Across machines this check would need clock-skew bounds.
+
+**Known limits.**
+- One copy on one disk: losing the state directory loses the cluster's
+  state. That is m4b's job (Raft: three copies, quorum commit).
+- The lock is held across the sync (see the ordering rule).
+- Submissions are not idempotent. If the master commits a submission and
+  dies before replying, the client sees an error, and a retry admits the
+  job twice. The bench counts this case: "batch tasks the master has"
+  against "acknowledged"; it was 0 in both runs, but it can happen. The
+  fix is a client-chosen request id, logged with `TasksSubmitted` and
+  deduplicated on apply.
+- Terminal tasks are never removed, so the state and the snapshot grow
+  with history.
+- The middle-of-log length corruption case above.
+
+### Measurements (Apple M5 Pro, 18 threads, APFS internal SSD, Release build)
+
+`bench/wal_commit.sh` (load average 2.70 3.07 2.76;
+`bench/results/wal_commit.txt`), 200 appends of one `TaskPlaced` record
+per mode:
+
+| sync mode | p50 | p99 | max |
+|---|---|---|---|
+| none (page cache only) | 0.002 ms | 0.005 ms | 0.268 ms |
+| fsync | 0.021 ms | 0.043 ms | 0.050 ms |
+| full (`F_FULLFSYNC`) | 3.005 ms | 4.953 ms | 5.047 ms |
+
+Group commit against per-record sync: the table above. Recovery, 100
+nodes:
+
+| records | tasks | log bytes | replay ms | snapshot bytes | snapshot load ms |
+|---|---|---|---|---|---|
+| 10,105 | 5,000 | 247,008 | 5.1 | 207,710 | 3.2 |
+| 100,150 | 50,000 | 2,590,530 | 20.1 | 2,052,711 | 17.8 |
+
+`bench/master_failure.sh` (`bench/results/master_failure.txt`, both
+runs). Master with a state directory, `F_FULLFSYNC`, a snapshot every 200
+records (so most restarts recover from a snapshot plus a log tail), 500 ms
+heartbeats. Four 4-core fleetlets with ProcessRuntime and event logs. 4
+long-running services, plus a client submitting a 2-task batch job (each
+task sleeps 0.1 to 0.9 s) every 250 ms. 20 times: wait 1.0 to 2.5 s,
+SIGKILL the master, start it again at once on the same directory.
+
+| from SIGKILL to | run 1 min / median / max | run 2 min / median / max |
+|---|---|---|
+| serving RPCs again | 24 / 29 / 32 ms | 22 / 28 / 32 ms |
+| scheduling again (every agent reported) | 40 / 241 / 525 ms | 44 / 340 / 488 ms |
+| of which: report window | 17 / 215 / 500 ms | 23 / 313 / 464 ms |
+
+| outcome | run 1 | run 2 |
+|---|---|---|
+| load average at start | 2.10 2.85 2.69 | 2.27 2.74 2.66 |
+| snapshots written | 3 | 4 (13.1 to 17.0 ms each) |
+| batch tasks acknowledged / in the master | 266 / 266 | 312 / 312 |
+| submissions refused while the master was down | 4 | 3 |
+| acknowledged tasks lost (not succeeded at the end) | 0 | 0 |
+| services still running at attempt 1 | 4 of 4 | 4 of 4 |
+| placed before a crash, never started, requeued at first report | 38 | 30 |
+| tasks / instances in event logs / tasks started twice | 270 / 270 / 0 | 316 / 316 / 0 |
+| overlapping instances of one task | 0 | 0 |
+| agents fenced / nodes re-registered | 0 / 0 | 0 / 0 |
+| torn tails found | 0 in 20 | 0 in 20 |
+
+How the times follow. Serving again in about 29 ms is process start, plus
+loading the snapshot and replaying at most about 200 records (0.4 to
+5.2 ms in run 2; each recovery's load time is printed in the master log),
+plus binding the port. The
+rest is the report window, which ends when the last agent's next
+heartbeat arrives. The four fleetlets were started within milliseconds of
+each other, so their 500 ms heartbeat phases are aligned: in the log, all
+four first reports after a restart arrive within about 8 ms of each
+other. The window is therefore the wait for one shared next beat, uniform
+on [0, 500) ms, which predicts a median near 250 ms and a max near 500.
+Measured: medians of 215 and 313 ms, maxima of 500 and 464 ms. With
+unaligned agents the window would be the latest of N phases (median near
+500 x 0.84 = 420 ms for four), still bounded by one heartbeat interval
+plus reconnect time. No torn tail appeared in 40 SIGKILLs. That is
+expected: data a `write()` has handed to the kernel sits in the page
+cache, which outlives the process, and each commit here is one small
+write of a few hundred bytes that the kernel completes before the
+process can die. So a SIGKILL could tear the log only in the middle of a
+large multi-page write, and a power cut or kernel panic is what really
+tears it. The torn-tail tests cut files byte by byte instead.
+
+ASan bench: `TRIALS=5 BIN=build-asan/bin PORT=17371
+bench/master_failure.sh` (load 2.15 2.75 2.67): PASS, 52 of 52
+acknowledged tasks succeeded, 56 tasks with 56 instances and 0 overlaps,
+kill to scheduling 160 / 261 / 515 ms, no sanitizer report in any
+master or agent log, nothing left behind.
+
+### Verification
+
+Tests: 155 in fleet_tests (33 new).
+- `Crc32c`, `WalRecord`, `Storage` (record round trip): the standard
+  CRC-32C check value (0xE3069283 for "123456789") and chaining; every
+  op type round-trips through frames; the byte layout is length, then
+  checksum, then payload; records appended and reopened rebuild the same
+  state.
+- `TornTail`: the log cut at every byte offset inside the last record
+  loses exactly that record and nothing else; recovery truncates the
+  tail and appends cleanly after it, at cuts in the header, at the
+  header/payload boundary and in the payload; a bad checksum on the last
+  record and trailing zero fill are both treated as torn.
+- `Corruption`: a flipped byte in the middle is refused (with the offset)
+  and the file is left as it was; an impossible length is damage even at
+  the end; a valid checksum over bytes that do not parse is an error; a
+  hole in the LSNs is refused.
+- `Snapshot` (snapshot round trip): a state with tasks in every state and
+  a dead node round-trips exactly; inconsistent snapshots (a running
+  task on a dead node, a live node with a revoked epoch, a duplicate node
+  name) are refused; snapshot, rotate, more records, then
+  recover from snapshot plus log; a crash between the snapshot rename and
+  the rotation skips the records already in the snapshot; a corrupt
+  snapshot is refused; snapshots are taken automatically every N records.
+- `GroupCommit`: one sync per batch against one per record (sync
+  counters); `F_FULLFSYNC` works on this file system.
+- `Replay.EqualsLiveStateForRandomizedOperationSequences` (replay equals
+  live state): 5 seeds x 3,000 random operations (submissions,
+  heartbeats with random exits, kills, rare drains, agents going silent,
+  restarting and joining, time passing, tick stalls, and master restarts
+  from the log, 19 to 40 per seed), with a follower `MasterState` that
+  applies every record the master makes. After every single operation the
+  follower's snapshot must equal the live one byte for byte (canonical
+  serialization), the master's invariants must hold, and every 97
+  operations the follower's own snapshot must rebuild to the same state.
+  It produced 3,166 to 7,383 records per seed, covering all 11 record
+  types in every seed.
+- `Recovery` (fake clock): no pass until every live node has reported,
+  then the window ends early and places the waiting task; the tick does
+  not spin during the window (the bug bench/master_failure.sh found: the
+  wake flag stayed set and the tick thread kept the lock, starving the
+  heartbeats it was waiting for); an unreported task is requeued and
+  started at attempt 2; unknown instances are stopped and the real one
+  kept; a late node stays suspect after the window, then rejoins with its
+  task untouched; a node that never reports dies 3 s after the restart,
+  not before; backoff deadlines survive a restart to the millisecond;
+  epochs continue from the log, with a floor of 1 so the clock cannot
+  help; an exit lost with an uncommitted batch is reported again and
+  applied exactly once; a drain in progress across a restart still
+  treats the exit as a move.
+- `MasterRestartTest` (real gRPC and processes, the master stopped and
+  started on the same port and directory): running tasks survive with
+  one start each and new work is scheduled after the restart; exits that
+  happen during the outage are applied once after it; recovery from a
+  snapshot plus the log after it; a corrupt log stops the master from
+  starting.
+
+| build | command | result | load average |
+|---|---|---|---|
+| Release | `ctest --test-dir build -j8` | 155/155, 9.95 s | 2.37 2.56 2.60 |
+| ASan + UBSan (Debug) | `ctest --test-dir build-asan -j8` | 155/155, 43.40 s | 2.40 2.56 2.60 |
+| TSan (RelWithDebInfo) | `ctest --test-dir build-tsan -j8` | 155/155, 36.69 s, no reports | 2.94 2.71 2.65 |
+| Release, repeated | `fleet_tests --gtest_filter='MasterRestartTest.*:Recovery.*:ClusterTest.*:Storage.*:Snapshot.*:GroupCommit.*:TornTail.*' --gtest_repeat=5` | 5/5, 34 tests each | 2.20 2.62 2.62 |
+| Release bench | `bench/master_failure.sh` (twice) and `bench/wal_commit.sh` | PASS both runs; numbers above | above |
+| ASan bench | `TRIALS=5 BIN=build-asan/bin PORT=17371 bench/master_failure.sh` | PASS, no sanitizer report | 2.15 2.75 2.67 |
+
+Zero warnings in project code (clean Release rebuild, `cmake --build
+build --target clean` then a full build, 55 steps: the only warning is
+GoogleTest's own `-Wcharacter-conversion` in gtest-printers.h, which is not
+compiled with fleet_flags; the ASan rebuild of 38 files printed only that
+same one).

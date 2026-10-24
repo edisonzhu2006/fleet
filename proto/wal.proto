@@ -1,0 +1,216 @@
+// wal.proto: the master's durable state, as a log of records and a
+// snapshot (m4).
+//
+// WHY THIS EXISTS, SEPARATE FROM fleet.proto. fleet.proto is the wire
+// contract between processes; this file is the storage format of one
+// process's state. They evolve for different reasons (a new RPC field is
+// not a new state field, and vice versa), so they live apart. The same
+// field-number rules apply (never renumber, never reuse), because a master
+// must read logs and snapshots written by its previous version.
+//
+// A STATE-MACHINE COMMAND LOG, NOT A LOG OF INPUTS. Each WalRecord is a
+// decision the master already made ("task 7 placed on node 2 as attempt
+// 3", "task 4 exited 1 and backs off until T"), never an input it still
+// has to decide about ("node 2 sent a heartbeat at time t"). Applying a
+// record (MasterState::apply) therefore needs no clock, no scheduler, no
+// failure detector and no randomness: the same records applied to the same
+// state always give the same state. That is what lets recovery replay the
+// log, and what lets m4b replicate it with Raft, where followers apply the
+// leader's records and must end up with the leader's state. Everything
+// time-dependent is decided before the record is written, and the record
+// carries the result (e.g. restart_at_ms).
+//
+// Times in records are wall-clock milliseconds since 1970, not the
+// steady clock the master uses for heartbeats: a steady clock's zero is
+// arbitrary per boot (and per machine, for m4b), so a steady time point
+// written before a crash means nothing after it. NOTES.md m4 says what a
+// wall-clock step costs.
+
+syntax = "proto3";
+
+package fleet.v1;
+
+import "fleet.proto";
+
+// ------------------------------------------------------------ records
+
+// A node registered: new (node_id == the number of nodes so far) or a
+// known name coming back. A returning node's tasks of its old epoch go
+// back to pending, and a dead node comes back ready (or draining, if an
+// operator had drained it).
+message NodeRegistered {
+  uint32 node_id = 1;
+  string name = 2;
+  Resources capacity = 3;
+  map<string, string> labels = 4;
+  // The epoch issued to this registration. After applying, the next
+  // epoch issued is above it, so epochs never repeat across restarts.
+  fixed64 epoch = 5;
+}
+
+// The failure detector declared the node dead: epoch revoked, tasks back
+// to pending.
+message NodeDied {
+  uint32 node_id = 1;
+}
+
+// An operator drained the node: no new tasks; its tasks are stopped and
+// moved one by one (TaskMoving, then TaskExited with outcome MOVED).
+message NodeDraining {
+  uint32 node_id = 1;
+}
+
+// `count` identical tasks admitted, with ids first_task_id .. +count-1.
+// One record for the whole submission: admission is all or nothing.
+message TasksSubmitted {
+  uint32 first_task_id = 1;
+  uint32 count = 2;
+  string job = 3;
+  int32 priority = 4;
+  Resources request = 5;
+  map<string, string> required_labels = 6;
+  repeated string argv = 7;
+  string image = 8;
+  RestartPolicy restart_policy = 9;
+}
+
+// The scheduler placed a pending task. `attempt` is the attempt this
+// placement creates (previous + 1); apply checks it, so a log applied to
+// the wrong state fails loudly instead of drifting.
+message TaskPlaced {
+  uint32 task_id = 1;
+  uint32 node_id = 2;
+  uint32 attempt = 3;
+  int64 placed_at_ms = 4;
+}
+
+// Evicted by a higher-priority task (back to pending, counts as a
+// preemption).
+message TaskPreempted {
+  uint32 task_id = 1;
+}
+
+// Back to pending for a reason that is not the task's fault and not
+// priority churn.
+message TaskRequeued {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    // Its node is draining and the agent does not report it running.
+    REASON_DRAIN = 1;
+    // The first report its node sent a restarted master did not list it
+    // (m4 recovery): the start never reached the agent.
+    REASON_UNREPORTED_AFTER_RESTART = 2;
+  }
+  uint32 task_id = 1;
+  Reason reason = 2;
+}
+
+// The master told the task's agent to stop it so it can be moved off a
+// draining node. Logged because it changes what the task's exit means: a
+// master that restarts mid-drain must still treat that exit as a move.
+message TaskMoving {
+  uint32 task_id = 1;
+}
+
+// The current attempt exited (or failed to start), and what the master
+// decided to do about it.
+message TaskExited {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    OUTCOME_MOVED = 1;     // it was being moved off a draining node: pending
+    OUTCOME_BACKOFF = 2;   // its restart policy reruns it at restart_at_ms
+    OUTCOME_FINISHED = 3;  // final: succeeded or failed
+  }
+  uint32 task_id = 1;
+  bool started = 2;  // false: it failed to start
+  int32 exit_code = 3;
+  int32 signal = 4;
+  bool oom_killed = 5;
+  string message = 6;
+  Outcome outcome = 7;
+  // OUTCOME_BACKOFF: when it becomes pending again, and the restart
+  // counters after this restart.
+  int64 restart_at_ms = 8;
+  uint32 consecutive_restarts = 9;
+  // OUTCOME_FINISHED: exit 0, no signal, and it started.
+  bool succeeded = 10;
+}
+
+// A backoff timer expired: the task is pending again.
+message TaskBackoffOver {
+  uint32 task_id = 1;
+}
+
+// A user killed it (from pending, running or backoff).
+message TaskKilled {
+  uint32 task_id = 1;
+}
+
+message WalRecord {
+  // Log sequence number: 1 for the first record ever, +1 per record, never
+  // reused. A snapshot records the last LSN it contains; replay checks
+  // that the log continues exactly there.
+  uint64 lsn = 1;
+  oneof op {
+    NodeRegistered node_registered = 2;
+    NodeDied node_died = 3;
+    NodeDraining node_draining = 4;
+    TasksSubmitted tasks_submitted = 5;
+    TaskPlaced task_placed = 6;
+    TaskPreempted task_preempted = 7;
+    TaskRequeued task_requeued = 8;
+    TaskMoving task_moving = 9;
+    TaskExited task_exited = 10;
+    TaskBackoffOver task_backoff_over = 11;
+    TaskKilled task_killed = 12;
+  }
+}
+
+// ------------------------------------------------------------ snapshot
+
+// Only primary state is stored. Everything derived (node allocations, the
+// pending queue, per-node task sets, quota usage, the backoff timer set)
+// is rebuilt on load and then checked by check_invariants(). Soft state
+// (heartbeat times, suspect flags) is not stored at all: it describes the
+// last few seconds, and a restarted master relearns it from heartbeats.
+
+message SnapshotNode {
+  string name = 1;
+  Resources capacity = 2;
+  map<string, string> labels = 3;
+  NodeState state = 4;
+  fixed64 epoch = 5;  // 0 once declared dead
+  bool drain_requested = 6;
+}
+
+message SnapshotTask {
+  string job = 1;
+  int32 priority = 2;
+  Resources request = 3;
+  map<string, string> required_labels = 4;
+  TaskState state = 5;
+  optional uint32 node = 6;  // set exactly when RUNNING
+  uint32 preempted_count = 7;
+  repeated string argv = 8;
+  string image = 9;
+  RestartPolicy restart_policy = 10;
+  uint32 attempt = 11;
+  optional uint32 last_node = 12;
+  int64 placed_at_ms = 13;
+  bool moving = 14;
+  uint32 restarts = 15;
+  uint32 consecutive_restarts = 16;
+  int64 restart_at_ms = 17;  // valid while BACKOFF
+  bool has_exit = 18;
+  int32 exit_code = 19;
+  int32 signal = 20;
+  bool oom_killed = 21;
+  string message = 22;
+}
+
+message Snapshot {
+  uint64 lsn = 1;  // the last record this snapshot includes
+  uint64 next_epoch = 2;
+  repeated SnapshotNode nodes = 3;  // index = node id
+  repeated SnapshotTask tasks = 4;  // index = task id
+}

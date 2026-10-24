@@ -1,0 +1,23 @@
+== machine: Apple M5 Pro, load: 2.70 3.07 2.76
+== /private/tmp is on: (apfs, local, journaled, nobrowse, protect, root data)
+== 1. append + sync of one TaskPlaced record (200 appends each)
+  sync mode                p50 ms     p99 ms     max ms
+  none (page cache)         0.002      0.005      0.268
+  fsync                     0.021      0.043      0.050
+  full (F_FULLFSYNC)        3.005      4.953      5.047
+
+== 2. one scheduling pass placing K tasks on 100 nodes, F_FULLFSYNC
+       K policy       syncs     bytes     runs    commit ms      records/s
+       1 group            1        21        5         2.89            346
+       1 per-record       1        21        5         2.95            338
+      10 group            1       228        5         3.94           2536
+      10 per-record      10       228        5        30.97            323
+     100 group            1      2372        5         2.86          34943
+     100 per-record     100      2372        5       306.16            327
+    1000 group            1     26524        5         3.17         315794
+    1000 per-record    1000     26524        1      3096.56            323
+
+== 3. recovery: replay the log vs load a snapshot (100 nodes)
+    records    tasks   log bytes    replay ms    us/record snapshot bytes      load ms
+      10105     5000      247008          5.1         0.51         207710          3.2
+     100150    50000     2590530         20.1         0.20        2052711         17.8

@@ -109,9 +109,35 @@ std::string Agent::container_name(uint32_t task_id, uint32_t attempt,
   return "fleet-" + std::to_string(task_id) + "-" + std::to_string(attempt) + "-" + hex;
 }
 
+void Agent::record_event(const char* what, const Key& key,
+                         std::chrono::system_clock::time_point when) {
+  if (!events_) return;
+  const long long us =
+      std::chrono::duration_cast<std::chrono::microseconds>(when.time_since_epoch()).count();
+  std::fprintf(events_, "%lld %s %u %u %llu %s\n", us, what, key.task_id, key.attempt,
+               static_cast<unsigned long long>(key.epoch), options_.name.c_str());
+  // Flushed per line so a reader sees events as they happen and a crash
+  // of this agent loses at most the line being written.
+  std::fflush(events_);
+}
+
+void Agent::kill_everything() {
+  runtime_->kill_all();  // SIGKILLs and waits for every task
+  const auto now = std::chrono::system_clock::now();
+  for (const auto& [key, inst] : instances_) {
+    if (inst.phase == v1::TaskStatus::PHASE_RUNNING && by_handle_.count(inst.handle)) {
+      record_event("exit", key, now);
+    }
+  }
+}
+
 void Agent::run() {
   std::error_code ec;
   std::filesystem::create_directories(options_.work_dir, ec);
+  if (!options_.event_log.empty()) {
+    events_ = std::fopen(options_.event_log.c_str(), "a");
+    if (!events_) log("cannot open event log " + options_.event_log.string());
+  }
   // Before registering: a previous fleetlet on this node that crashed left
   // its tasks running, and registering makes the master requeue them, so
   // they must be gone first (see Runtime::kill_leftovers).
@@ -147,9 +173,13 @@ void Agent::run() {
                                            options_.poll_interval),
                    [this] { return stop_; });
   }
-  runtime_->kill_all();
+  kill_everything();
   log("stopped; killed remaining tasks");
   publish_stats();
+  if (events_) {
+    std::fclose(events_);
+    events_ = nullptr;
+  }
 }
 
 void Agent::do_register() {
@@ -190,6 +220,7 @@ void Agent::collect_exits() {
     inst.signal = e.signal;
     inst.oom_killed = e.oom_killed;
     inst.message = e.message;
+    record_event("exit", h->second, std::chrono::system_clock::now());
     log("task " + std::to_string(h->second.task_id) + " attempt " +
         std::to_string(h->second.attempt) +
         (e.start_failed ? " failed to start: " + e.message
@@ -263,7 +294,7 @@ void Agent::fence(const std::string& why) {
   // kill_all() SIGKILLs and waits for every task. The instance table goes
   // too: exits not yet acknowledged belong to the revoked epoch, and the
   // master ignores everything reported under it.
-  runtime_->kill_all();
+  kill_everything();
   instances_.clear();
   by_handle_.clear();
   registered_ = false;
@@ -298,11 +329,14 @@ void Agent::launch(const v1::TaskLaunch& l) {
                                        ".a" + std::to_string(key.attempt) + ".log");
   spec.image = l.image();
   spec.name = container_name(key.task_id, key.attempt, key.epoch);
+  // Stamped before start(): the process may be running before it returns.
+  const auto launched_at = std::chrono::system_clock::now();
   StartResult r = runtime_->start(spec);
   if (r.ok) {
     inst.handle = r.handle;
     by_handle_[r.handle] = key;
     ++started_;
+    record_event("start", key, launched_at);
     log("started task " + std::to_string(key.task_id) + " (" + l.job() +
         ") attempt " + std::to_string(key.attempt) + ", log " + spec.log_path.string());
   } else {

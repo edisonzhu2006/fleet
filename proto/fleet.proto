@@ -86,11 +86,12 @@ message RegisterNodeResponse {
   // a heartbeat carrying an old epoch (FAILED_PRECONDITION: the agent
   // kills everything and registers again). When the failure detector
   // declares a node dead, its epoch is revoked, so the node is fenced off
-  // even if it was only partitioned. The counter starts at the master's
-  // wall-clock time in microseconds, so a restarted master (no persistent
-  // state before m4) still issues epochs larger than before its restart,
-  // whose task ids it may reuse. Was a random "incarnation" in m2; see
-  // NOTES.md m3 for why ordering matters.
+  // even if it was only partitioned. Since m4 the counter is durable (every
+  // registration is a write-ahead-log record, synced before this response
+  // is sent), so a restarted master continues above every epoch it ever
+  // issued; the wall clock in microseconds is only its starting floor.
+  // Was a random "incarnation" in m2; see NOTES.md m3 for why ordering
+  // matters.
   fixed64 epoch = 2;          // fixed64: values near 2^51, varint would be 8 bytes too
   uint32 heartbeat_interval_ms = 3; // the master tells agents its cadence
 }
@@ -250,8 +251,11 @@ message DrainResponse {
 service Master {
   // Agent-facing.
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
-  // NOT_FOUND: unknown node id (master restarted): the agent registers
-  // again and keeps its tasks, which the master then stops as stale.
+  // NOT_FOUND: unknown node id (a master without a state directory
+  // restarted and forgot it): the agent registers again and keeps its
+  // tasks, which the master then stops as stale. A master with a state
+  // directory (m4) remembers every node and epoch, so after its restart
+  // the agent's next heartbeat is simply accepted.
   // FAILED_PRECONDITION: stale or revoked epoch (the node was declared
   // dead, or registered again since): the master may already have
   // rescheduled these tasks elsewhere, so the agent kills every task at

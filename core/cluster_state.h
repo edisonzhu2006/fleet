@@ -33,6 +33,7 @@ struct SubmitResult {
   bool ok = false;
   TaskId id = 0;       // valid only when ok
   std::string reason;  // why it was rejected, when !ok
+  bool over_quota = false;  // rejected for quota (vs. an invalid spec)
 };
 
 // Order of the pending queue: higher priority first, then older (lower id)
@@ -68,6 +69,11 @@ class ClusterState {
   // Admission control. Validates the spec and charges the job's quota; on
   // success the task is pending. Rejections carry a human-readable reason.
   SubmitResult submit(const TaskSpec& spec);
+  // The same checks for `count` copies of spec, changing nothing (m4: the
+  // master must know a whole submission will be admitted before it logs
+  // it, because a logged record has to apply). ok == true means
+  // submit(spec) would succeed `count` times in a row.
+  SubmitResult check_admission(const TaskSpec& spec, uint32_t count) const;
 
   // Transitions used by the scheduler and, later, the master. Each returns
   // false (and changes nothing) if the transition is illegal, so a buggy
@@ -85,6 +91,19 @@ class ClusterState {
   bool enter_backoff(TaskId task);
   bool leave_backoff(TaskId task);
   bool kill(TaskId task);  // pending|running|backoff -> killed
+
+  // Recovery (m4): rebuild a ClusterState from a snapshot, nodes first and
+  // then tasks, each in id order. restore_node is add_node plus a state (a
+  // fresh node has no tasks, so no requeue happens). restore_task appends
+  // a task in any state and updates every derived structure (the node's
+  // allocation and task set, the pending queue, quota usage) exactly as
+  // the transitions that led there would have. It returns false, changing
+  // nothing, if the task does not fit what is already restored: an id out
+  // of order, a running task without a live node or over its capacity, a
+  // node set on a task that is not running. A snapshot that fails here is
+  // corrupt, and recovery refuses it.
+  NodeId restore_node(Resources capacity, Labels labels, NodeState state);
+  bool restore_task(const Task& t);
 
   // True when the node accepts tasks (ready, not suspect), carries every
   // label the task requires, and has room for its request right now.

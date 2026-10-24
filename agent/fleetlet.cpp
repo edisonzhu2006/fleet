@@ -25,7 +25,7 @@ void usage() {
                "usage: fleetlet --name NAME --cpu MILLICPU --mem MB [--master HOST:PORT]\n"
                "                [--label k=v]... [--work-dir DIR] [--stop-grace-ms N]\n"
                "                [--runtime process|docker] [--docker-image IMAGE]\n"
-               "                [--docker CLI] [--docker-poll-ms N] [--quiet]\n"
+               "                [--docker CLI] [--docker-poll-ms N] [--event-log FILE] [--quiet]\n"
                "  flags also accept --flag=value\n");
 }
 
@@ -84,6 +84,8 @@ int main(int argc, char** argv) {
       dk.docker = next();
     } else if (a == "--docker-poll-ms") {
       dk.poll_interval = std::chrono::milliseconds(std::stoi(next()));
+    } else if (a == "--event-log") {
+      opt.event_log = next();
     } else if (a == "--quiet") {
       opt.log_events = false;
     } else {

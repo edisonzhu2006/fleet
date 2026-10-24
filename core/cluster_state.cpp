@@ -71,7 +71,7 @@ void ClusterState::set_quota(const std::string& job, Resources limit) {
   quotas_[job].limit = limit;
 }
 
-SubmitResult ClusterState::submit(const TaskSpec& spec) {
+SubmitResult ClusterState::check_admission(const TaskSpec& spec, uint32_t count) const {
   SubmitResult r;
   if (spec.job.empty()) {
     r.reason = "job name is empty";
@@ -91,13 +91,25 @@ SubmitResult ClusterState::submit(const TaskSpec& spec) {
     r.reason = "request out of range: " + to_string(spec.request);
     return r;
   }
-  JobQuota& q = quotas_[spec.job];
-  if (q.limit && !(q.used + spec.request).fits_in(*q.limit)) {
-    r.reason = "job " + spec.job + " over quota: used " + to_string(q.used) +
-               " + request " + to_string(spec.request) + " > limit " +
-               to_string(*q.limit);
+  // count * request cannot overflow: both factors are below 2^32 and 2^31.
+  const Resources total{spec.request.milli_cpu * count, spec.request.memory_mb * count};
+  auto q = quotas_.find(spec.job);
+  if (q != quotas_.end() && q->second.limit &&
+      !(q->second.used + total).fits_in(*q->second.limit)) {
+    r.reason = "job " + spec.job + " over quota: used " + to_string(q->second.used) +
+               " + request " + to_string(total) + " > limit " +
+               to_string(*q->second.limit);
+    r.over_quota = true;
     return r;
   }
+  r.ok = true;
+  return r;
+}
+
+SubmitResult ClusterState::submit(const TaskSpec& spec) {
+  SubmitResult r = check_admission(spec, 1);
+  if (!r.ok) return r;
+  JobQuota& q = quotas_[spec.job];
   q.used += spec.request;
 
   Task t;
@@ -111,6 +123,39 @@ SubmitResult ClusterState::submit(const TaskSpec& spec) {
   r.ok = true;
   r.id = tasks_.back().id;
   return r;
+}
+
+NodeId ClusterState::restore_node(Resources capacity, Labels labels, NodeState state) {
+  const NodeId id = add_node(capacity, std::move(labels));
+  nodes_[id].state = state;
+  return id;
+}
+
+bool ClusterState::restore_task(const Task& t) {
+  if (t.id != tasks_.size()) return false;
+  if (t.priority < 0 || t.priority > kMaxPriority) return false;
+  if (t.state == TaskState::kRunning) {
+    if (!t.node || *t.node >= nodes_.size()) return false;
+    const Node& n = nodes_[*t.node];
+    // Not feasible(): a running task may legitimately sit on a draining
+    // node. It only has to be on a node that is not dead and fit there.
+    if (n.state == NodeState::kDead || !t.request.fits_in(n.free())) return false;
+  } else if (t.node) {
+    return false;
+  }
+  tasks_.push_back(t);
+  Task& added = tasks_.back();
+  // Touch the job's quota entry even for a terminal task, as submit() did
+  // when the task was admitted, so the set of known jobs matches too.
+  JobQuota& q = quotas_[added.job];
+  if (!is_terminal(added.state)) q.used += added.request;
+  if (added.state == TaskState::kRunning) {
+    nodes_[*added.node].allocated += added.request;
+    on_node_[*added.node].insert(added.id);
+  } else if (added.state == TaskState::kPending) {
+    pending_.insert(PendingKey{-added.priority, added.id});
+  }
+  return true;
 }
 
 bool ClusterState::labels_match(const Labels& required, const Labels& have) {

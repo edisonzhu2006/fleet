@@ -3,10 +3,13 @@
 
 #include "master_server.h"
 
+#include <cstdlib>
+
 #include <grpcpp/security/server_credentials.h>
 #include <grpcpp/server_builder.h>
 
 #include "fleet.grpc.pb.h"
+#include "log.h"
 
 namespace fleet {
 
@@ -18,33 +21,35 @@ class MasterServer::Service final : public v1::Master::Service {
 
   grpc::Status RegisterNode(grpc::ServerContext*, const v1::RegisterNodeRequest* req,
                             v1::RegisterNodeResponse* resp) override {
-    return call([&] { return m_->core_.register_node(*req, resp, Clock::now()); });
+    return call([&] { return m_->core_->register_node(*req, resp, Clock::now()); });
   }
   grpc::Status Heartbeat(grpc::ServerContext*, const v1::HeartbeatRequest* req,
                          v1::HeartbeatResponse* resp) override {
-    return call([&] { return m_->core_.heartbeat(*req, resp, Clock::now()); });
+    return call([&] { return m_->core_->heartbeat(*req, resp, Clock::now()); });
   }
   grpc::Status Submit(grpc::ServerContext*, const v1::SubmitRequest* req,
                       v1::SubmitResponse* resp) override {
-    return call([&] { return m_->core_.submit(*req, resp); });
+    return call([&] { return m_->core_->submit(*req, resp); });
   }
   grpc::Status List(grpc::ServerContext*, const v1::ListRequest* req,
                     v1::ListResponse* resp) override {
-    return call([&] { return m_->core_.list(*req, resp, Clock::now()); });
+    return call([&] { return m_->core_->list(*req, resp, Clock::now()); });
   }
   grpc::Status Kill(grpc::ServerContext*, const v1::KillRequest* req,
                     v1::KillResponse* resp) override {
-    return call([&] { return m_->core_.kill(*req, resp); });
+    return call([&] { return m_->core_->kill(*req, resp); });
   }
   grpc::Status Drain(grpc::ServerContext*, const v1::DrainRequest* req,
                      v1::DrainResponse* resp) override {
-    return call([&] { return m_->core_.drain(*req, resp); });
+    return call([&] { return m_->core_->drain(*req, resp); });
   }
 
  private:
-  // Every handler: lock, run, and if the call changed something the
-  // scheduler cares about, wake the tick thread so a submission is placed
-  // now rather than at the next tick. notify after unlocking so the woken thread does
+  // Every handler: lock, run, commit (the ordering rule in
+  // master_server.h: the reply below is sent only after this call's
+  // records are durable), and if the call changed something the scheduler
+  // cares about, wake the tick thread so a submission is placed now rather
+  // than at the next tick. notify after unlocking so the woken thread does
   // not immediately block on the mutex we still hold.
   template <typename F>
   grpc::Status call(F&& f) {
@@ -53,7 +58,8 @@ class MasterServer::Service final : public v1::Master::Service {
     {
       std::lock_guard<std::mutex> lock(m_->mu_);
       s = f();
-      wake = m_->core_.needs_schedule();
+      m_->commit_locked();
+      wake = m_->core_->needs_schedule();
     }
     if (wake) m_->cv_.notify_one();
     return s;
@@ -62,12 +68,41 @@ class MasterServer::Service final : public v1::Master::Service {
   MasterServer* m_;
 };
 
-MasterServer::MasterServer(MasterServerOptions options)
-    : options_(std::move(options)), core_(options_.core) {}
+MasterServer::MasterServer(MasterServerOptions options) : options_(std::move(options)) {}
 
 MasterServer::~MasterServer() { shutdown(); }
 
 bool MasterServer::start(std::string* error) {
+  // Recovery comes before the port opens, so no RPC can see a half-built
+  // state. (No other thread exists yet, so mu_ is not needed here.)
+  if (options_.state_dir.empty()) {
+    core_ = std::make_unique<MasterCore>(options_.core);
+  } else {
+    MasterState recovered;
+    std::string err;
+    storage_ = Storage::open(options_.state_dir, options_.storage, &recovered, &recovery_, &err);
+    if (!storage_) {
+      if (error) *error = "recovery failed: " + err;
+      return false;
+    }
+    if (options_.core.log_events) {
+      log_line("fleetmaster",
+               "state dir " + options_.state_dir.string() + ": " +
+                   (recovery_.had_snapshot
+                        ? "snapshot at lsn " + std::to_string(recovery_.snapshot_lsn)
+                        : std::string("no snapshot")) +
+                   ", replayed " + std::to_string(recovery_.replayed) + " record(s) (skipped " +
+                   std::to_string(recovery_.skipped) + " already in the snapshot), discarded a " +
+                   "torn tail of " + std::to_string(recovery_.torn_bytes) + " byte(s); lsn " +
+                   std::to_string(recovery_.lsn) + "; loaded in " +
+                   std::to_string(recovery_.load_ms) + " ms");
+    }
+    // An empty log is a first start, not a recovery: there is nobody to
+    // wait for.
+    core_ = recovery_.lsn > 0
+                ? std::make_unique<MasterCore>(options_.core, std::move(recovered), Clock::now())
+                : std::make_unique<MasterCore>(options_.core);
+  }
   service_ = std::make_unique<Service>(this);
   grpc::ServerBuilder builder;
   // Plaintext: m2 runs on localhost. TLS (grpc::SslServerCredentials) is a
@@ -103,7 +138,42 @@ void MasterServer::shutdown() {
 
 void MasterServer::with_core(const std::function<void(MasterCore&)>& fn) {
   std::lock_guard<std::mutex> lock(mu_);
-  fn(core_);
+  if (!core_) return;
+  fn(*core_);
+  commit_locked();
+}
+
+StorageStats MasterServer::storage_stats() {
+  std::lock_guard<std::mutex> lock(mu_);
+  return storage_ ? storage_->stats() : StorageStats{};
+}
+
+void MasterServer::commit_locked() {
+  std::vector<v1::WalRecord> records = core_->take_records();
+  if (records.empty() || !storage_) return;  // no state dir: nothing to keep
+  std::string err;
+  if (!storage_->append(records, &err)) {
+    // The in-memory state is now ahead of the disk, and nothing that
+    // depends on it may be sent. Stopping is the only safe move; the next
+    // start recovers from what the disk does have.
+    log_line("fleetmaster", "FATAL: write-ahead log append failed: " + err);
+    std::abort();
+  }
+  if (storage_->snapshot_due()) {
+    const auto t0 = Clock::now();
+    if (!storage_->write_snapshot(core_->durable_state(), &err)) {
+      log_line("fleetmaster", "FATAL: snapshot failed: " + err);
+      std::abort();
+    }
+    if (options_.core.log_events) {
+      log_line("fleetmaster",
+               "snapshot at lsn " + std::to_string(core_->durable_state().lsn()) +
+                   " written and log rotated in " +
+                   std::to_string(std::chrono::duration<double, std::milli>(Clock::now() - t0)
+                                      .count()) +
+                   " ms");
+    }
+  }
 }
 
 void MasterServer::tick_loop() {
@@ -112,7 +182,7 @@ void MasterServer::tick_loop() {
     // Wakes on the timer or on an event; the predicate guards against
     // spurious wakeups and against a notify that arrived before we waited.
     cv_.wait_for(lock, options_.tick_interval,
-                 [this] { return stopping_ || core_.needs_schedule(); });
+                 [this] { return stopping_ || core_->needs_schedule(); });
     if (stopping_) break;
     // The tick runs under the lock. A scheduling pass is microseconds at
     // this scale (NOTES.md m1: mean 2.4 us per decision on 100 nodes) and
@@ -120,7 +190,8 @@ void MasterServer::tick_loop() {
     // about than copying state out and merging decisions back in. `now`
     // is read while holding the lock, so every heartbeat already recorded
     // is stamped no later than the time this tick judges silence against.
-    core_.tick(Clock::now());
+    core_->tick(Clock::now());
+    commit_locked();
   }
 }
 
