@@ -57,6 +57,16 @@ bool Agent::stop_requested() const {
   return stop_;
 }
 
+void Agent::set_partitioned(bool partitioned) {
+  std::lock_guard<std::mutex> lock(mu_);
+  partitioned_ = partitioned;
+}
+
+bool Agent::partitioned() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return partitioned_;
+}
+
 Agent::Stats Agent::stats() const {
   std::lock_guard<std::mutex> lock(mu_);
   return stats_;
@@ -70,6 +80,7 @@ void Agent::publish_stats() {
   stats_.heartbeats_ok = hb_ok_;
   stats_.heartbeats_failed = hb_failed_;
   stats_.started = started_;
+  stats_.fenced = fenced_;
 }
 
 void Agent::log(const std::string& line) const {
@@ -79,34 +90,43 @@ void Agent::log(const std::string& line) const {
 }
 
 Agent::Key Agent::key_of(const v1::TaskInstance& inst) {
-  return Key{inst.task_id(), inst.attempt(), inst.incarnation()};
+  return Key{inst.task_id(), inst.attempt(), inst.epoch()};
 }
 
 std::string Agent::container_name(uint32_t task_id, uint32_t attempt,
-                                  uint64_t incarnation) {
-  // fleet-<task>-<attempt>-<first 8 hex digits of the incarnation>.
-  // (task, attempt) alone is unique only within one master's lifetime: a
-  // restarted master numbers tasks from 0 again, and Docker refuses a
-  // second container with a name in use (a leftover from before the
-  // restart would make every start fail). The incarnation is random per
-  // registration, so adding it makes names unique across restarts of
-  // either side, and keeps them readable in `docker ps`.
-  char inc[17];
-  std::snprintf(inc, sizeof(inc), "%016llx", static_cast<unsigned long long>(incarnation));
-  return "fleet-" + std::to_string(task_id) + "-" + std::to_string(attempt) + "-" +
-         std::string(inc, 8);
+                                  uint64_t epoch) {
+  // fleet-<task>-<attempt>-<epoch in hex>. (task, attempt) alone is
+  // unique only within one master's lifetime: a restarted master numbers
+  // tasks from 0 again, and Docker refuses a second container with a name
+  // in use (a leftover from before the restart would make every start
+  // fail). Epochs are never reused, across registrations and across
+  // master restarts (see MasterCore::default_first_epoch), so adding the
+  // whole epoch makes names unique. All of it, not a prefix: m3 epochs
+  // come from a counter, so their high digits are the same for every
+  // registration and only the low ones differ.
+  char hex[17];
+  std::snprintf(hex, sizeof(hex), "%llx", static_cast<unsigned long long>(epoch));
+  return "fleet-" + std::to_string(task_id) + "-" + std::to_string(attempt) + "-" + hex;
 }
 
 void Agent::run() {
   std::error_code ec;
   std::filesystem::create_directories(options_.work_dir, ec);
+  // Before registering: a previous fleetlet on this node that crashed left
+  // its tasks running, and registering makes the master requeue them, so
+  // they must be gone first (see Runtime::kill_leftovers).
+  if (const size_t n = runtime_->kill_leftovers(); n > 0) {
+    log("killed " + std::to_string(n) + " task(s) left running by a previous fleetlet");
+  }
   auto next_beat = std::chrono::steady_clock::now();
   while (!stop_requested()) {
     collect_exits();
     const auto now = std::chrono::steady_clock::now();
     if (now >= next_beat) {
       const bool was_registered = registered_;
-      if (!registered_) {
+      if (partitioned()) {
+        ++hb_failed_;  // dropped by the (simulated) network
+      } else if (!registered_) {
         do_register();
       } else {
         do_heartbeat();
@@ -149,7 +169,7 @@ void Agent::do_register() {
   }
   registered_ = true;
   node_id_ = resp.node_id();
-  incarnation_ = resp.incarnation();
+  epoch_ = resp.epoch();
   if (resp.heartbeat_interval_ms() > 0) {
     options_.heartbeat_interval = std::chrono::milliseconds(resp.heartbeat_interval_ms());
   }
@@ -183,12 +203,12 @@ void Agent::collect_exits() {
 void Agent::do_heartbeat() {
   v1::HeartbeatRequest req;
   req.set_node_id(node_id_);
-  req.set_incarnation(incarnation_);
+  req.set_epoch(epoch_);
   for (const auto& [key, inst] : instances_) {
     v1::TaskStatus* st = req.add_tasks();
     st->mutable_instance()->set_task_id(key.task_id);
     st->mutable_instance()->set_attempt(key.attempt);
-    st->mutable_instance()->set_incarnation(key.incarnation);
+    st->mutable_instance()->set_epoch(key.epoch);
     st->set_phase(inst.phase);
     st->set_exit_code(inst.exit_code);
     st->set_signal(inst.signal);
@@ -201,12 +221,17 @@ void Agent::do_heartbeat() {
   grpc::Status s = stub_->Heartbeat(&ctx, req, &resp);
   if (!s.ok()) {
     ++hb_failed_;
-    if (s.error_code() == grpc::StatusCode::NOT_FOUND ||
-        s.error_code() == grpc::StatusCode::FAILED_PRECONDITION) {
-      // The master does not know this registration (it restarted, or it
-      // gave our node a newer incarnation). Register again; tasks keep
-      // running and are reported under their old incarnation, which the
-      // master will tell us to stop.
+    if (s.error_code() == grpc::StatusCode::FAILED_PRECONDITION) {
+      // Fenced: our epoch is stale or revoked (see agent.h).
+      fence(s.error_message());
+      return;
+    }
+    if (s.error_code() == grpc::StatusCode::NOT_FOUND) {
+      // The master does not know our node at all: it restarted and lost
+      // its state (no persistence before m4). It cannot have rescheduled
+      // tasks it never knew, so they keep running; we register again and
+      // report them under their old epoch, and the master stops them as
+      // stale.
       registered_ = false;
     }
     log("heartbeat failed: " + s.error_message());
@@ -231,6 +256,19 @@ void Agent::do_heartbeat() {
     }
   }
   for (const v1::TaskLaunch& l : resp.start()) launch(l);
+}
+
+void Agent::fence(const std::string& why) {
+  const size_t n = runtime_->live_count();
+  // kill_all() SIGKILLs and waits for every task. The instance table goes
+  // too: exits not yet acknowledged belong to the revoked epoch, and the
+  // master ignores everything reported under it.
+  runtime_->kill_all();
+  instances_.clear();
+  by_handle_.clear();
+  registered_ = false;
+  ++fenced_;
+  log("fenced: " + why + "; killed " + std::to_string(n) + " task(s); registering again");
 }
 
 void Agent::launch(const v1::TaskLaunch& l) {
@@ -259,7 +297,7 @@ void Agent::launch(const v1::TaskLaunch& l) {
   spec.log_path = options_.work_dir / (l.job() + ".t" + std::to_string(key.task_id) +
                                        ".a" + std::to_string(key.attempt) + ".log");
   spec.image = l.image();
-  spec.name = container_name(key.task_id, key.attempt, key.incarnation);
+  spec.name = container_name(key.task_id, key.attempt, key.epoch);
   StartResult r = runtime_->start(spec);
   if (r.ok) {
     inst.handle = r.handle;

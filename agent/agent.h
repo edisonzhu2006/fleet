@@ -1,5 +1,5 @@
 #pragma once
-// Agent: the node-side half of fleet (fleetlet's logic, m2).
+// Agent: the node-side half of fleet (fleetlet's logic, m2; fencing m3).
 //
 // WHY THIS EXISTS. A node needs one process that (1) tells the master it
 // exists and how big it is, (2) every heartbeat interval reports exactly
@@ -17,9 +17,19 @@
 // running meanwhile: losing the master does not stop work.
 //
 // INSTANCE IDENTITY. A running copy is keyed by (task id, attempt,
-// incarnation), the TaskInstance in fleet.proto. A start for a key already
+// epoch), the TaskInstance in fleet.proto. A start for a key already
 // in the table (running or exited but not yet forgotten) is ignored; that
 // is what makes the master's re-sent starts harmless.
+//
+// FENCING (m3). When the master refuses a heartbeat with
+// FAILED_PRECONDITION, this agent's epoch is stale or revoked: the master
+// declared the node dead (it was partitioned, paused, or too slow) or saw
+// a newer registration, and may already be running these tasks
+// elsewhere. The agent then kills every task immediately (SIGKILL, not a
+// graceful stop: each extra moment is a moment two copies run) and only
+// then registers again. Before this response arrives the agent cannot
+// know it was fenced; NOTES.md m3 discusses that window and why a lease
+// is what closes it.
 
 #include <chrono>
 #include <compare>
@@ -69,6 +79,11 @@ class Agent {
   void request_stop();
   void join();
 
+  // Fault injection for tests: while partitioned, the loop makes no RPCs
+  // (as if every message were dropped) but keeps running its tasks, which
+  // is exactly what a network partition looks like from the agent's side.
+  void set_partitioned(bool partitioned);
+
   struct Stats {
     bool registered = false;
     uint32_t node_id = 0;
@@ -76,18 +91,19 @@ class Agent {
     uint64_t heartbeats_ok = 0;
     uint64_t heartbeats_failed = 0;
     uint64_t started = 0;
+    uint64_t fenced = 0;  // times the master refused our epoch
   };
   Stats stats() const;  // thread-safe
 
   // Container name DockerRuntime gives an instance; see agent.cpp.
   static std::string container_name(uint32_t task_id, uint32_t attempt,
-                                    uint64_t incarnation);
+                                    uint64_t epoch);
 
  private:
   struct Key {
     uint32_t task_id = 0;
     uint32_t attempt = 0;
-    uint64_t incarnation = 0;
+    uint64_t epoch = 0;
     friend auto operator<=>(const Key&, const Key&) = default;
   };
   struct Instance {
@@ -100,6 +116,8 @@ class Agent {
   };
 
   bool stop_requested() const;
+  bool partitioned() const;
+  void fence(const std::string& why);
   void do_register();
   void do_heartbeat();
   void collect_exits();
@@ -115,15 +133,16 @@ class Agent {
   // Loop-thread state (no lock needed).
   bool registered_ = false;
   uint32_t node_id_ = 0;
-  uint64_t incarnation_ = 0;
+  uint64_t epoch_ = 0;
   std::map<Key, Instance> instances_;
   std::map<RuntimeHandle, Key> by_handle_;
-  uint64_t hb_ok_ = 0, hb_failed_ = 0, started_ = 0;
+  uint64_t hb_ok_ = 0, hb_failed_ = 0, started_ = 0, fenced_ = 0;
 
   // Shared with other threads.
   mutable std::mutex mu_;
   std::condition_variable cv_;
   bool stop_ = false;
+  bool partitioned_ = false;
   Stats stats_;
   std::thread thread_;
 };

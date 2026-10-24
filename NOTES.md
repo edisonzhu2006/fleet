@@ -781,3 +781,367 @@ placement-to-start 1 / 415 / 469 ms, nothing left behind. After all runs
 `docker ps -a --filter name=fleet-` lists no containers. Zero warnings in
 project code (clean Release rebuild; the one warning is GoogleTest's own
 `-Wcharacter-conversion` in gtest-all.cc).
+
+## 2026-10-24: m3, failure detection, rescheduling, fencing, drain, restart policies
+
+What was built:
+- `master/failure_detector.{h,cpp}`: `FailureDetector`, a clock-free
+  alive / suspect / dead state machine over heartbeat silence.
+- `master/restart_policy.h`: the never / on-failure / always policies and
+  the capped exponential backoff schedule, as pure functions.
+- `MasterCore` (rewritten around a reconciler): per-registration epochs
+  from a monotonic counter, `tick(now)` (failure detection, backoff
+  timers, a scheduling pass), fencing of stale and revoked epochs, restart
+  policies, graceful drain. `MasterServer`'s scheduler thread became a
+  tick thread (100 ms, `--tick-ms`).
+- `ClusterState`: `requeue` (running to pending without counting a
+  preemption), `enter_backoff` / `leave_backoff` and a new `kBackoff`
+  task state, `Node::suspect`, and draining no longer evicts.
+- Agent: on `FAILED_PRECONDITION` it SIGKILLs every task and registers
+  again; before its first registration it kills tasks a crashed
+  predecessor left running (`Runtime::kill_leftovers`, both runtimes);
+  `set_partitioned()` fault injection for tests.
+- Wire: `incarnation` renamed `epoch` (same field numbers and type, so
+  the wire is unchanged), `TASK_STATE_BACKOFF`, `RestartPolicy` on
+  `SubmitRequest`, `NodeInfo.suspect` / `epoch`, `TaskInfo.restart_policy`
+  / `restarts` / `restart_in_ms`, `DrainResponse.evicted` renamed
+  `moving`.
+- CLI: `fleetmaster --heartbeat-ms --suspect-after --dead-after --tick-ms
+  --backoff-base-ms --backoff-max-ms --backoff-reset-ms` (integer flags
+  now range-checked); `fleetctl submit --restart`, `list` shows `suspect`,
+  `backoff Ns`, the policy and the restart count.
+- `bench/node_failure.sh`, output in `bench/results/node_failure.txt`.
+
+**Counted missed heartbeats with two thresholds, instead of one timeout
+or a phi-accrual detector.** `missed = floor(silence / interval)`;
+suspect at 3, dead at 6 (flags). Why two states: a node that has missed
+1.5 s of heartbeats is probably in trouble, so new work should not be
+sent there, but moving its tasks is expensive and, if it is only slow,
+creates a second copy of each. Suspect therefore stops placements and
+nothing else; dead moves everything. One timeout would force a choice
+between reacting early (false deaths) and placing work onto dying
+machines. Phi-accrual (Hayashibara et al.; Cassandra, Akka) estimates the
+inter-arrival distribution and adapts to jitter; fleet's master sets the
+agents' cadence itself, so "6 missed beats" is a number an operator can
+reason about and detection time follows from two flags (measured below).
+Cost: a fixed threshold cannot adapt, so a stall longer than 3 s (a long
+GC pause, a swapped-out agent, a slow link) is a false death. Dead is
+absorbing: a heartbeat does not revive a dead node, only a new
+registration does, so a flapping link cannot make a node oscillate
+between dead and alive while its tasks are being rescheduled. The
+detector takes `now` on every call and owns no clock, which is what lets
+`FailureDetectorTest` step time 10 ms at a time and assert that suspicion
+comes at exactly 1,500 ms and death at exactly 3,000 ms.
+
+**Judged at the master, every 100 ms tick.** The tick bounds how late a
+death is noticed (at most one tick after the sixth missed beat), so it is
+a fifth of the heartbeat interval. Not handled: if the master itself
+stalls (the tick thread is starved, or the process is paused), every node
+looks silent when it resumes and all are declared dead at once
+(`Failover.ATickStallDeclaresDeathOnceNotOnEveryTick` shows the one-shot
+declaration). A guard such as "do not declare deaths on a tick that ran
+much later than scheduled", or refusing to evict when a large fraction of
+nodes fail together (Kubernetes' node lifecycle controller slows
+evictions when a zone looks disrupted), is the fix; it was left out to
+keep the detector a pure function of heartbeat times.
+
+**Epoch from one master-wide counter that only goes up, seeded from the
+wall clock, instead of a random 64-bit incarnation (m2).** Both make every
+registration distinguishable, which is all the master's own checks use
+(an instance or heartbeat is current only if its epoch equals the node's
+current one). Ordering is what a fencing token needs beyond that: anyone
+who sees tokens can reject a smaller one than the largest seen, without
+asking the master (Kleppmann's fencing-token argument for distributed
+locks). fleet does not use that yet; m5's checkpoint storage is where it
+will, rejecting a checkpoint write tagged with an older epoch than the
+last one accepted, which protects the stateful jobs even when a fenced
+node has not yet heard that it is fenced. A random value cannot do that.
+One global counter rather than one per node: epochs are then unique across
+nodes too (container names use them), and m4 has one number to persist.
+The seed is microseconds since 1970, so a master restarted after any real
+downtime starts above everything its predecessor issued; that matters
+because a restarted master numbers tasks from 0 again, and an old process
+"task 0, attempt 1, epoch E" must never match a new task 0. Cost: it
+assumes the wall clock does not step backwards across a master restart
+(NTP can); m4 persists the counter in the WAL and drops the assumption.
+Zero is never issued and means "revoked". The container name now carries
+the whole epoch in hex: with a counter the high digits are identical for
+every registration, so m2b's 8-digit prefix would have collided.
+
+**Fencing: refuse the whole heartbeat, and the agent kills everything
+before registering again.** A heartbeat carrying an epoch other than the
+node's current one, including a revoked one, gets `FAILED_PRECONDITION`
+and nothing in it is applied: its exits describe instances the master no
+longer tracks (an exit of the old copy must not finish the new one), and
+its liveness must not count. The agent then SIGKILLs every task and only
+then registers. Why not m2's path (register again, report the old tasks,
+get them stopped as stale): by the time a node is fenced its tasks are
+already running elsewhere, so every moment they run is a duplicate; a
+graceful stop would add the stop grace to that, and if registration
+fails (the master is unreachable again) the stale-stop path never runs at
+all. `NOT_FOUND` (the master has no record of the node at all, i.e. it
+restarted without state) keeps the m2 behavior of registering and
+letting the master stop stale instances, because a master that never knew
+the tasks cannot have rescheduled them.
+
+What fencing prevents: a node that was declared dead and comes back
+continuing to run, and to report on, tasks that now run elsewhere; any
+report from an older registration (an earlier agent process, or a
+duplicate agent with the same name) changing state; exits of old attempts
+finishing new ones. What it cannot prevent: **a partitioned node does not
+hear that it was fenced.** Its agent cannot reach the master, so it keeps
+running its copies until the partition heals and its first heartbeat is
+refused. Measured below: with the partition held 1 s past the restart,
+old and new copies ran side by side for 1,093 ms, and that window is
+simply the partition's length minus the 2.9 s it took to restart the work
+elsewhere. It is unbounded. Fencing by epoch also cannot undo side effects
+the old copy already committed. **The real fix is a lease**: each
+accepted heartbeat grants the agent a lease of L seconds; an agent that
+cannot renew kills its own tasks when its lease runs out; the master
+reschedules a dead node's tasks only after L plus a margin for clock
+*rate* drift has passed since its last accepted heartbeat (each side
+measures with its own monotonic clock, so only rates, not absolute times,
+need to agree). With L shorter than the dead timeout, the old copy is
+gone before the new one exists. Cost of a lease: a master outage longer
+than L stops every task in the cluster, trading availability during
+control-plane outages for never running twice; storage-side fencing
+tokens (above) are the belt to that brace. Not built in m3; m4b's leader
+election has the same shape and is the place to build it once.
+
+**One reconciler, level-triggered, instead of an event handler per kind
+of failure.** Desired state is ClusterState. The reconciler is the only
+code that turns observations into desired-state changes, in two halves:
+`tick(now)` (the cluster half: silence becomes suspect or dead, finished
+backoffs become pending, then a scheduling pass) and `heartbeat()` (the
+node half: apply the report, then reply with the diff between what is
+placed on the node and what it reports: start, stop, forget). Restart,
+reschedule-after-death and drain are each only a change to desired state;
+the same diff carries them out, and because the reply depends only on
+current state, any lost message is repaired by the next heartbeat. The
+alternative, edge-triggered handlers ("on node death, send starts to the
+new nodes"), must never lose an event and must be replayed exactly after
+a crash. Why the per-node diff runs on the heartbeat rather than on the
+tick: in the pull model a reply is the only way to reach an agent, and a
+heartbeat is when the freshest report exists; diffing on the tick against
+a cached report would compare older data and still wait for the same
+heartbeat to deliver the result.
+
+**Restart policy is decided at the master and goes through the scheduler,
+not restarted in place by the agent.** On an exit of the current attempt:
+`never` finishes it (succeeded or failed by exit code); `on-failure`
+restarts it unless it exited 0; `always` restarts it on any exit; a start
+failure counts as a failure; an unset policy is `never`, so m2 clients
+behave as before. A restarted task enters `kBackoff` (no node, not
+pending, quota still charged), waits `min(max, base * 2^(n-1))` for the
+n-th consecutive restart (1 s, doubling, capped at 60 s), then becomes
+pending and is placed like any task, on whichever node fits. The count
+resets once an attempt has stayed up `reset_after` (60 s), so a service
+that crashes once a day restarts after 1 s, not 60. Why at the master:
+the task leaves the node, so a task crashing because of its machine (a
+bad disk, a full /tmp) gets a different one, and the backoff timer is
+visible in `fleetctl list`. Restarting in place at the agent (kubelet's
+approach) is faster (no placement, no heartbeat round trip) and keeps
+node-local state; it is the better choice once tasks have local disks.
+Why a `kBackoff` state instead of "pending with a not-before time": the
+scheduler stays a pure pass over the pending queue with no clock, and the
+timers live in one ordered set the tick pops in O(log n). Why doubling by
+a loop instead of `base << (n-1)`: the shift overflows for large n; the
+loop stops at the cap after at most log2(max/base) steps. Preemption,
+drain and node death are not the task's fault: they requeue it at once,
+whatever its policy, and never touch its backoff
+(`Restart.NodeDeathIsNotTheTasksFaultAndSkipsBackoff`). Cost: the reset
+clock starts at placement, so it includes up to one heartbeat before the
+process actually started.
+
+**Graceful drain: stop first, move after, instead of make-before-break.**
+`fleetctl drain NODE` marks the node draining (no new tasks) and returns.
+On each heartbeat from that node, a task it reports running is told to
+stop (again every beat until its exit arrives); the exit is recorded as a
+move, not as the task's own exit, and the task goes back to pending and
+is placed elsewhere at a new attempt. A task placed there that the node
+does not report is not running there and moves at once: the agent sends
+each heartbeat only after applying the previous reply, and no start is
+sent to a draining node, so no start can be in flight. Make-before-break
+(start the replacement, then stop the original) gives a stateless service
+zero downtime, but it runs two copies at once, which for m5's stateful
+jobs means two writers to one checkpoint, and it needs spare capacity.
+Cost: each moved task is down for one heartbeat to deliver the stop, the
+stop itself, one heartbeat to report the exit, and one more for the
+replacement's start: in `bench/local_cluster.sh` the drained `web` task
+was reported stopped 739 ms after the drain and its replacement started
+504 ms later (1,243 ms down). Edge cases, each tested: a task that exits
+on its own before any stop was sent follows its policy (a finished batch
+task is not rerun); one that exits in the instant after the stop was sent
+is rerun (at least once for that race, never two copies at once); a
+draining node that dies hands its tasks over at once; a dead node cannot
+be drained; the operator's drain survives the node dying and
+re-registering (kept apart from NodeState, which death overwrites).
+Draining no longer evicts in ClusterState, so its invariant became "every
+running task is on a node that is not dead". Not built: `undrain` (a
+drained node returns to service only by re-registering, as in m2).
+
+**Leftovers of a crashed agent are killed before it registers (deferred
+from m2 and m2b).** Without this, a SIGKILLed fleetlet's tasks keep
+running as orphans, the restarted fleetlet knows nothing of them, and its
+registration makes the master requeue them: duplicates forever, which no
+epoch can reach. ProcessRuntime records each task's pid and kernel start
+time (`sysctl(KERN_PROC_PID)` on macOS, `/proc/<pid>/stat` field 22 on
+Linux) in `<work-dir>/pids`, deletes the record when it reaps the task,
+and a fresh runtime kills the process group of every recorded pid whose
+process still has the recorded start time. The start time is what makes it
+safe: pids are reused, and a bare pid could by now name an unrelated
+process (`ProcessRuntimeTest.KillLeftoversNeverKillsAReusedPid`).
+DockerRuntime labels containers `fleet.owner=<node>` and removes every
+container carrying its node's label (a label, not the `fleet-` name
+prefix, because nodes share a daemon in tests and benches). Limits: a
+task whose group leader exited while the agent was down leaves its other
+group members alive (only a live leader can be matched), and a crash
+between fork and writing the record leaves that task unrecorded. Linux's
+`PR_SET_PDEATHSIG` would let tasks die with the agent, but macOS has
+nothing like it, and it would also kill tasks on a mere agent upgrade.
+
+**Suspect is a flag on the node, not a NodeState.** A ready or a draining
+node can be suspect, and a suspect node keeps its tasks; it only drops
+out of placement and preemption (`Node::accepts_tasks()`).
+
+**Testing with a fake clock and a fake partition.** Every MasterCore and
+FailureDetector call takes `now`, so `FailoverTest`, `FencingTest`,
+`RestartTest` and `DrainTest` step time by hand (no sleeps) and check
+`check_invariants()`, which now also verifies: backoff timers match
+exactly the tasks in backoff, detector health agrees with node state and
+epoch (dead iff kDead iff epoch 0; suspect iff the flag), live epochs are
+distinct and already issued, and "moving" is set only on tasks running on
+a draining node. Over the wire, `Agent::set_partitioned()` drops all RPCs
+while tasks keep running, which is a partition as the agent sees it. The
+integration tests declare a node dead after 30 missed 100 ms beats rather
+than 6: under TSan a fork takes hundreds of ms on the agent's heartbeat
+thread, and 600 ms would kill healthy nodes in unrelated tests.
+
+What is unchanged and still open: on macOS memory is still not enforced
+per task by ProcessRuntime (`setrlimit(RLIMIT_AS)` is refused below the
+process's large default reservation, measured in m2; DockerRuntime
+enforces it with cgroups), and CPU is enforced only by the scheduler's
+accounting. A preemption victim still overlaps its preemptor for up to
+the stop grace (m2 known gap): fixing it means the ledger keeps the
+victim's resources reserved until its exit is reported, a ClusterState
+change of its own.
+
+### Measurements (Apple M5 Pro, 18 threads, Release build)
+
+`bench/node_failure.sh` (10 trials; load average at start 3.26 3.91
+3.89; full output in `bench/results/node_failure.txt`). Master: 500 ms
+heartbeats, suspect after 3 missed, dead after 6, 100 ms tick. Four
+4-core fleetlets with ProcessRuntime, six 1-core `sleep` tasks; each trial
+SIGKILLs the fleetlet running task 0 at a random point (0 to 499 ms) in
+its heartbeat cycle. That node held 4 tasks in every trial.
+
+| from SIGKILL to | min | median | max |
+|---|---|---|---|
+| master declares the node dead | 2,606 ms | 2,771 ms | 2,950 ms |
+| first replacement process started | 2,625 ms | 2,854 ms | 3,055 ms |
+| last of the 4 replacements started | 2,749 ms | 3,107 ms | 3,440 ms |
+
+How the numbers follow from the settings. Death is declared on the first
+tick at which 6 x 500 = 3,000 ms have passed since the node's last
+heartbeat; the master logged 3,004 to 3,099 ms of silence at each of the
+11 deaths (10 trials plus the partition), i.e. 3,000 ms plus up to one
+100 ms tick. The kill lands phi after that last heartbeat, phi uniform in
+[0, 500), so kill-to-dead = 3,000 - phi + (0 to 100) ms, which predicts
+2,500 to 3,100 ms with a median near 2,800: measured 2,606 to 2,950,
+median 2,771. Suspicion came at 1,528 to 1,602 ms of silence (3 x 500 plus
+about one tick; the tick timer starts after the previous tick's work, so
+it can run a few ms past 100). The tasks are requeued and placed in the same tick that
+declares the death; each replacement then starts on its new node's next
+heartbeat, which is up to 500 ms away: the first replacement started 5 to
+129 ms after the death in these trials (the earliest of the target nodes'
+heartbeats), the last 7 to 494 ms after it (the latest). So the worst case is about 3,100 + 500 =
+3,600 ms; to halve it, halve the interval (twice the heartbeat load) or
+the miss count (twice the false-death risk).
+
+After each trial the script restarts the fleetlet under the same name; it
+killed exactly the 4 orphans its SIGKILLed predecessor left (checked by
+the script every trial) and re-registered with a new epoch. The orphans
+had run beside their replacements for 112 to 509 ms, which measures how
+fast the script restarted the agent, not fleet: with an agent down for
+longer, that window is as long as the agent is down. Machine failures do
+not have this window (the tasks die with the machine); agent crashes on a
+healthy machine do, until the agent comes back.
+
+Partition trial (same run): SIGSTOP one fleetlet, which freezes the agent
+but not its tasks. Its 4 tasks were running elsewhere 2,880 ms later
+while all 4 old copies kept running. After a further second the script
+sent SIGCONT; the agent's next heartbeat was refused ("node n1 was
+declared dead; epoch ... is revoked") and it killed its 4 copies 4 ms
+after SIGCONT, then re-registered. Old and new copies ran side by side for
+1,093 ms = partition length 3,969 ms - 2,880 ms to restart elsewhere +
+4 ms to be told. That is the window only a lease closes.
+
+`bench/local_cluster.sh` (m2's scenario, now with graceful drain; load
+3.55 3.91 3.90; `bench/results/local_cluster.txt`): every outcome as
+expected, settled in 6,579 ms, placement-to-start 1 / 435 / 504 ms
+(min / median / max over 15 placements), the drained `web` task moved
+from n3 to n1 as above, nothing left behind.
+
+### Verification
+
+Tests: 122 in fleet_tests (36 new, 1 rewritten).
+- `FailureDetector` (9, fake clock): misses are whole intervals of
+  silence and never negative; suspect at exactly 1,500 ms and dead at
+  exactly 3,000 ms when stepped 10 ms at a time; 200 heartbeats arriving
+  480 ms late never raise suspicion; a heartbeat clears suspicion and
+  restarts the silence clock; dead is absorbing until a new registration;
+  a stalled evaluator goes straight from alive to dead in one change;
+  nodes are independent and reported in id order; last-heard never moves
+  backwards; thresholds that cannot work are rejected.
+- `RestartPolicy` and `Backoff` (4): which exits restart under each
+  policy; 1, 2, 4, 8, 16, 32, 60, 60 s; n = 0, a huge n, a cap that is not
+  a power-of-two multiple of the base, base = cap, base 0.
+- `Failover` (3), `Fencing` (3), `Restart` (6), `Drain` (4): MasterCore
+  with a fake clock. A silent node is suspect at 1.5 s and dead at 3 s,
+  its epoch revoked and its task requeued without counting a preemption
+  or a restart, then started elsewhere at attempt 2; a suspect node gets
+  no new tasks until it is heard from; a tick stall declares a death once;
+  epochs only go up, and a later master starts above an earlier one; a
+  fenced node's heartbeat is refused and nothing in it (running copies, an
+  exit) is applied, and after re-registering, reports under the old epoch
+  are stopped and their exits ignored; an older epoch is refused while the
+  node is alive; on-failure backs off 100, 200, 400, 800, 800 ms (not one
+  millisecond early) and stops at exit 0; the backoff resets after an
+  attempt that stayed up; never and unset policies finish; an unknown
+  policy value is rejected; a start failure is a failure; a kill during
+  backoff is final, cancels the timer and releases quota; node death skips
+  backoff; the drain cases listed above.
+- `MasterCore.DrainStopsTheTaskFirstAndMovesItAfterItsExit` (rewritten):
+  no second copy is placed while the first runs; stop re-sent every beat;
+  the exit (SIGTERM, 143) is a move, not a failure; attempt 2 elsewhere.
+- `ClusterTest` (3 new, 1 strengthened, real processes over gRPC): a
+  stopped agent's task restarts on the other node after at least 2.8 s
+  (30 missed 100 ms beats) and the node lists as dead with epoch 0; a
+  partitioned agent keeps its copy running while the replacement starts,
+  then is fenced when the partition heals, kills its copy and comes back
+  ready with a larger epoch; on-failure reruns a task that fails twice
+  until it succeeds at attempt 3 with 2 restarts; drain samples the
+  per-node process counts every 20 ms and never sees both copies at once.
+- `ProcessRuntimeTest` (3 new): a second runtime kills the group of a
+  task an earlier one left running (it dies of SIGKILL); a record whose
+  pid is alive but whose start time differs, and one for a pid that does
+  not exist, are left alone and cleaned up; records disappear as tasks
+  exit. `FakeDockerTest` (1 new): containers carry the owner label, and
+  `kill_leftovers` lists by that label and removes what it finds.
+- `Property`: now also requeue, backoff in and out, kill from backoff and
+  suspect flips; seed 2 did 105 requeues, 92 backoffs and 102 suspect
+  flips with every invariant checked after each of 5,000 operations.
+
+| build | command | result | load average |
+|---|---|---|---|
+| Release | `ctest --test-dir build` | 122/122, 19.49 s | 2.55 3.28 3.63 |
+| ASan + UBSan | `ctest --test-dir build-asan` | 122/122, 36.81 s | 3.52 3.72 3.85 |
+| TSan | `ctest --test-dir build-tsan` | 122/122, 149.30 s, no reports | 3.73 3.74 3.85 |
+| Release, repeated | `fleet_tests --gtest_filter='ClusterTest.*:Failover.*:Fencing.*:Restart.*:Drain.*:FailureDetector.*:ProcessRuntimeTest.*:FakeDockerTest.Owner*' --gtest_repeat=5` | 5/5, 45 tests each | 3.38 4.06 4.00 |
+| Release, concurrent | `ctest --test-dir build -j 18 --repeat until-fail:3` | 122/122, 9.91 s | 2.91 3.76 3.89 |
+| ASan bench | `TRIALS=3 BIN=build-asan/bin bench/node_failure.sh` | all trials recovered (dead 2,577 to 2,975 ms), partition fenced, no sanitizer report in any log, nothing left behind | 3.72 3.92 3.94 |
+
+Zero warnings in project code (clean Release rebuild, `cmake --build
+build --clean-first`; the one warning is `-Wcharacter-conversion` inside
+GoogleTest's own gtest-printers.h, not compiled with fleet_flags; the
+ASan and TSan rebuilds printed none).

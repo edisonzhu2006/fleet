@@ -75,7 +75,7 @@ if the master dies", and "how did you test that".
 ## Failure handling
 
 - Heartbeats every 500 ms; a node missing 3 consecutive heartbeats is suspect, 6 is dead (configurable). Dead node's tasks go back to pending and are rescheduled.
-- A node that comes back after being declared dead is told to kill whatever it is running (fencing by node epoch), so a task never runs twice.
+- A node that comes back after being declared dead is told to kill whatever it is running (fencing by node epoch), so once it is back in contact a task never runs twice. A partitioned node cannot be told, so it runs its copies until it reconnects; closing that window needs a lease (NOTES.md m3).
 - Reconciler: every tick, compare desired state (master's view) with actual state (agents' reports) and issue start/stop to converge. This is the single mechanism behind restarts, rescheduling and drain.
 - Master restart: replay snapshot + WAL, then wait one heartbeat window for agents to report what they actually run before scheduling, so nothing is double-started.
 

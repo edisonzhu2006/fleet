@@ -176,7 +176,7 @@ std::optional<PreemptionPlan> Scheduler::plan_preemption(
   bool truncated = false;
 
   for (const Node& n : state.nodes()) {
-    if (n.state != NodeState::kReady ||
+    if (!n.accepts_tasks() ||
         !task.request.fits_in(n.capacity) ||
         !ClusterState::labels_match(task.required_labels, n.labels)) {
       continue;

@@ -14,8 +14,8 @@
 // ready, the labels match, the task fits) and applies it. Keeping policy out
 // of the state class is what lets three placement strategies share it.
 //
-// SINGLE-THREADED by design in m1. The master (m2) will own one instance
-// and serialize access through its event loop.
+// SINGLE-THREADED by design. The master owns one instance and serializes
+// access to it with one mutex (master/master_server.h).
 
 #include <compare>
 #include <cstdint>
@@ -50,12 +50,16 @@ class ClusterState {
   // (see the comment on kMaxCapacity for why there is a ceiling at all).
   NodeId add_node(Resources capacity, Labels labels = {});
 
-  // Changing a node to draining or dead evicts its running tasks back to
-  // pending. m1 drain is immediate, not graceful: there are no real
-  // processes yet, and it keeps the invariant "every running task is on a
-  // ready node" exact. Graceful drain (start the replacement, then stop
-  // the original) arrives with the reconciler in m3.
+  // Dead returns the node's running tasks to pending at once: the machine
+  // is gone, so nothing is left to stop. Draining (m3) leaves them where
+  // they are: the node takes no new tasks, and the master moves each one
+  // with requeue() only once its agent reports the process gone, so two
+  // copies never run at the same time. (m1 drained immediately, which is
+  // what let a drained task's replacement start while the original was
+  // still in its stop grace period.)
   void set_node_state(NodeId id, NodeState state);
+  // Suspect (m3): see Node::suspect. Changes nothing but placement.
+  void set_node_suspect(NodeId id, bool suspect);
 
   // Quotas. Setting a limit below current usage is allowed (existing tasks
   // are not killed, as in Borg); it only blocks new submissions.
@@ -70,11 +74,20 @@ class ClusterState {
   // caller fails loudly in tests instead of corrupting state.
   bool place(TaskId task, NodeId node);  // pending -> running
   bool evict(TaskId task);               // running -> pending (preemption)
+  // running -> pending for reasons that are not priority churn: its node
+  // was lost, or it was moved off a draining node (m3). Unlike evict(),
+  // does not count as a preemption.
+  bool requeue(TaskId task);
   bool finish(TaskId task, bool succeeded);  // running -> succeeded/failed
-  bool kill(TaskId task);                // pending|running -> killed
+  // The restart policy path (m3): running -> backoff when the task exited
+  // and will be rerun, then backoff -> pending when its delay is over.
+  // Quota stays charged throughout: the task is alive, only waiting.
+  bool enter_backoff(TaskId task);
+  bool leave_backoff(TaskId task);
+  bool kill(TaskId task);  // pending|running|backoff -> killed
 
-  // True when the node is ready, carries every label the task requires,
-  // and has room for its request right now.
+  // True when the node accepts tasks (ready, not suspect), carries every
+  // label the task requires, and has room for its request right now.
   bool feasible(const Task& task, const Node& node) const;
   static bool labels_match(const Labels& required, const Labels& have);
 
@@ -92,9 +105,10 @@ class ClusterState {
   // Returns an empty string when everything holds, otherwise one line per
   // violation. Checks:
   //   1. no node's allocated exceeds its capacity (no overcommit)
-  //   2. every running task is on a ready node, and listed in that node's
-  //      task set; every pending task is in the pending queue; terminal
-  //      tasks are in neither
+  //   2. every running task is on a node that is not dead (ready or
+  //      draining, suspect or not) and listed in that node's task set;
+  //      every pending task is in the pending queue; backoff and terminal
+  //      tasks are in neither and have no node
   //   3. each node's allocated equals the sum of requests placed on it
   //   4. each job's quota usage equals the sum of its live requests
   // O(nodes + tasks): cheap enough to run after every operation in tests.

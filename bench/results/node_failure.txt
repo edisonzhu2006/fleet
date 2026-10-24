@@ -1,0 +1,38 @@
+== machine: Apple M5 Pro, load: 3.26 3.91 3.89
+  17:06:41.377 fleetmaster: listening on port 17270; heartbeat 500 ms, suspect after 3 missed, dead after 6, tick 100 ms
+
+== 10 SIGKILL trials
+  trial node   tasks   kill->dead  kill->1st run kill->last run   orphans killed
+  1     n4     4          2796 ms        2801 ms        2803 ms      4 after  115 ms
+  2     n1     4          2950 ms        3055 ms        3440 ms      4 after  476 ms
+  3     n2     4          2628 ms        2734 ms        2749 ms      4 after  112 ms
+  4     n4     4          2851 ms        2959 ms        3341 ms      4 after  469 ms
+  5     n1     4          2912 ms        3004 ms        3036 ms      4 after  163 ms
+  6     n2     4          2733 ms        2846 ms        3181 ms      4 after  456 ms
+  7     n4     4          2734 ms        2863 ms        2904 ms      4 after  168 ms
+  8     n1     4          2747 ms        2840 ms        3178 ms      4 after  408 ms
+  9     n2     4          2902 ms        2977 ms        3396 ms      4 after  509 ms
+  10    n4     4          2606 ms        2625 ms        3030 ms      4 after  485 ms
+
+== summary over 10 trials (4+4+4+4+4+4+4+4+4+4 tasks moved)
+  kill -> declared dead        min  2606  median  2771  max  2950 ms
+  kill -> first replacement    min  2625  median  2854  max  3055 ms
+  kill -> last replacement     min  2749  median  3107  max  3440 ms
+  orphans beside replacements  min   112  median   432  max   509 ms
+  expected: dead in (2500, 3100] ms (6 x 500 ms of silence minus the kill's phase in
+  the heartbeat cycle, plus up to one 100 ms tick); a replacement up to 500 ms after
+  that (the target node's next heartbeat carries the start). Orphans ran beside their
+  replacements until this script restarted the fleetlet: that number measures the
+  script's restart, not fleet; on a real machine it is however long the agent is down
+
+== partition trial: SIGSTOP a fleetlet, its tasks keep running
+  n1 stopped; 4 task(s) restarted elsewhere; the stopped node still runs 4 of its 4 old copies
+  agent log: fleetlet[n1]: fenced: node n1 was declared dead; epoch 1792876001374887 is revoked; kill all tasks and register again; killed 4 task(s); registering again
+  SIGCONT -> fenced and its copies killed: 4 ms
+  old and new copies ran side by side for 1093 ms
+    (= partition length 3969 ms - time to restart elsewhere 2880 ms
+       + time to be told 4 ms: it grows with the partition, unbounded)
+  copies left on n1 after fencing: 0; n1 is ready again
+
+== teardown
+no task processes left behind

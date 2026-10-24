@@ -26,8 +26,8 @@
 //     into `reserved`;
 //   - every enum's zero value is UNSPECIFIED, because proto3 decodes an
 //     unknown or missing enum as 0 and that must not read as a real state.
-// Messages that will grow in later milestones (TaskLaunch gains a restart
-// policy and a checkpoint dir in m3/m5) note where.
+// Messages that will grow in later milestones (TaskLaunch gains a
+// checkpoint dir in m5) note where.
 
 syntax = "proto3";
 
@@ -43,7 +43,7 @@ enum NodeState {
   NODE_STATE_UNSPECIFIED = 0;
   NODE_STATE_READY = 1;
   NODE_STATE_DRAINING = 2;
-  NODE_STATE_DEAD = 3;  // set by the failure detector from m3 on
+  NODE_STATE_DEAD = 3;  // set by the failure detector (m3)
 }
 
 enum TaskState {
@@ -53,6 +53,19 @@ enum TaskState {
   TASK_STATE_SUCCEEDED = 3;
   TASK_STATE_FAILED = 4;
   TASK_STATE_KILLED = 5;
+  // Exited, and its restart policy says to run it again once its backoff
+  // delay has passed (m3). Not on any node; its quota stays charged.
+  TASK_STATE_BACKOFF = 6;
+}
+
+// What happens when a task's process exits on its own (m3). Preemption,
+// drain and node loss are not exits of the task: those always reschedule
+// it, whatever the policy, and never count toward its backoff.
+enum RestartPolicy {
+  RESTART_POLICY_UNSPECIFIED = 0;  // treated as NEVER, the m2 behavior
+  RESTART_POLICY_NEVER = 1;        // any exit is final
+  RESTART_POLICY_ON_FAILURE = 2;   // restart unless it exited 0
+  RESTART_POLICY_ALWAYS = 3;       // restart on any exit (services)
 }
 
 // ---------------------------------------------------------------- agents
@@ -65,13 +78,20 @@ message RegisterNodeRequest {
 
 message RegisterNodeResponse {
   uint32 node_id = 1;
-  // A fresh random 64-bit value per registration. Every task the agent
-  // starts is tagged with the incarnation it was started under, and the
-  // master stops any reported task whose incarnation is not the node's
-  // current one. That fences off processes left from a previous agent run,
-  // and, because it is random rather than a counter, also processes from
-  // before a master restart, whose task ids the new master may reuse.
-  fixed64 incarnation = 2;          // fixed64: random values are full width
+  // The fencing token (m3). Every registration gets a new epoch from one
+  // master-wide counter that only goes up, so a later registration always
+  // has a larger epoch than any earlier one. Every task the agent starts
+  // is tagged with the epoch it was started under; the master stops any
+  // reported task whose epoch is not the node's current one, and refuses
+  // a heartbeat carrying an old epoch (FAILED_PRECONDITION: the agent
+  // kills everything and registers again). When the failure detector
+  // declares a node dead, its epoch is revoked, so the node is fenced off
+  // even if it was only partitioned. The counter starts at the master's
+  // wall-clock time in microseconds, so a restarted master (no persistent
+  // state before m4) still issues epochs larger than before its restart,
+  // whose task ids it may reuse. Was a random "incarnation" in m2; see
+  // NOTES.md m3 for why ordering matters.
+  fixed64 epoch = 2;          // fixed64: values near 2^51, varint would be 8 bytes too
   uint32 heartbeat_interval_ms = 3; // the master tells agents its cadence
 }
 
@@ -82,7 +102,7 @@ message RegisterNodeResponse {
 message TaskInstance {
   uint32 task_id = 1;
   uint32 attempt = 2;      // bumped by the master on every placement
-  fixed64 incarnation = 3; // node incarnation the instance was started in
+  fixed64 epoch = 3; // node epoch the instance was started in
 }
 
 message TaskStatus {
@@ -106,7 +126,7 @@ message TaskStatus {
 
 message HeartbeatRequest {
   uint32 node_id = 1;
-  fixed64 incarnation = 2;
+  fixed64 epoch = 2;
   // Everything the agent runs, plus exits the master has not yet
   // acknowledged (see HeartbeatResponse.forget). A full report every time,
   // not a delta, so a lost heartbeat loses nothing.
@@ -132,7 +152,7 @@ message HeartbeatResponse {
   // start for an instance it already has.
   repeated TaskLaunch start = 1;
   // Instances the agent reported running that should not be: killed,
-  // preempted, drained, or from a stale incarnation.
+  // preempted, being moved off a draining node, or from a stale epoch.
   repeated TaskInstance stop = 2;
   // Exits the master has recorded; the agent stops reporting them. Until
   // then it reports them every heartbeat, so an exit survives a lost
@@ -152,6 +172,7 @@ message SubmitRequest {
   // Container image for DockerRuntime nodes (m2b); empty = the node's
   // default. Validated by the master (see core/model.h valid_image_ref).
   string image = 7;
+  RestartPolicy restart_policy = 8;  // m3; unset = NEVER
 }
 
 message SubmitResponse {
@@ -171,6 +192,10 @@ message NodeInfo {
   map<string, string> labels = 6;
   int64 ms_since_heartbeat = 7;
   uint32 running_tasks = 8;
+  // The failure detector has missed suspect_after heartbeats in a row
+  // (m3). A suspect node keeps its tasks but gets no new ones.
+  bool suspect = 9;
+  fixed64 epoch = 10;  // current registration; 0 once declared dead
 }
 
 message TaskInfo {
@@ -189,6 +214,9 @@ message TaskInfo {
   uint32 preempted_count = 13;
   string image = 14;      // as submitted; empty = the node's default
   bool oom_killed = 15;   // with has_exit: the last attempt was OOM-killed
+  RestartPolicy restart_policy = 16;
+  uint32 restarts = 17;   // times its restart policy has rerun it
+  int64 restart_in_ms = 18;  // when BACKOFF: time left before it is pending again
 }
 
 message ListResponse {
@@ -212,14 +240,22 @@ message DrainRequest {
 }
 
 message DrainResponse {
-  repeated uint32 evicted = 1;  // tasks sent back to pending
+  // Tasks on the node when the drain began (m3: drain is graceful). Each
+  // is stopped where it runs and rescheduled only after its agent reports
+  // it gone, so two copies never run at once. Was "evicted" in m2, when
+  // drain requeued them at once; same field number, so the wire is unchanged.
+  repeated uint32 moving = 1;
 }
 
 service Master {
   // Agent-facing.
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
-  // NOT_FOUND: unknown node id (master restarted); FAILED_PRECONDITION:
-  // stale incarnation. Either way the agent registers again.
+  // NOT_FOUND: unknown node id (master restarted): the agent registers
+  // again and keeps its tasks, which the master then stops as stale.
+  // FAILED_PRECONDITION: stale or revoked epoch (the node was declared
+  // dead, or registered again since): the master may already have
+  // rescheduled these tasks elsewhere, so the agent kills every task at
+  // once, then registers again (fencing, m3).
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
   // User-facing (fleetctl).

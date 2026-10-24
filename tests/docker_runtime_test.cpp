@@ -24,6 +24,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -95,13 +96,15 @@ TEST(DockerArgs, ImageReferencesThatCouldBeFlagsAreRejected) {
   EXPECT_FALSE(valid_image_ref(std::string(256, 'a')));
 }
 
-TEST(DockerArgs, ContainerNamesIncludeTaskAttemptAndIncarnation) {
-  EXPECT_EQ(Agent::container_name(3, 1, 0x9f2c4a1b00000000ULL), "fleet-3-1-9f2c4a1b");
-  EXPECT_EQ(Agent::container_name(0, 12, 0x1ULL), "fleet-0-12-00000000");
+TEST(DockerArgs, ContainerNamesIncludeTaskAttemptAndEpoch) {
+  EXPECT_EQ(Agent::container_name(3, 1, 0x9f2c4a1b00000000ULL), "fleet-3-1-9f2c4a1b00000000");
+  EXPECT_EQ(Agent::container_name(0, 12, 0x1ULL), "fleet-0-12-1");
   // Same task and attempt under two registrations: different names, so a
   // container left over from before a restart cannot block a new start.
-  EXPECT_NE(Agent::container_name(5, 1, 0xaaaaaaaa00000000ULL),
-            Agent::container_name(5, 1, 0xbbbbbbbb00000000ULL));
+  // m3 epochs are consecutive counter values, so they differ only in their
+  // low digits; the whole epoch has to be in the name.
+  const uint64_t e = 0x63f2a1b2c3d40ULL;  // a typical wall-clock-seeded epoch
+  EXPECT_NE(Agent::container_name(5, 1, e), Agent::container_name(5, 1, e + 1));
 }
 
 // ------------------------------------------------------------ the fake CLI
@@ -164,6 +167,13 @@ stop)
   done
   exit 0 ;;
 logs) cat "$C/$1.out" 2>/dev/null; exit 0 ;;
+ps)
+  # Lists every container it knows; the label filter is checked by the
+  # test from argv.log, not applied here.
+  for f in "$C"/*; do
+    case "$f" in *.out) ;; *) [ -f "$f" ] && basename "$f" ;; esac
+  done
+  exit 0 ;;
 rm)
   [ "$1" = "-f" ] && shift
   for n in "$@"; do rm -f "$C/$n" "$C/$n.out"; echo "$n"; done
@@ -489,13 +499,42 @@ TEST_F(FakeDockerTest, KillAllForceRemovesEverythingInOneCall) {
   EXPECT_EQ(rms[0], (Argv{"rm", "-f", "fleet-14-1-aaaa", "fleet-15-1-aaaa"}));
 }
 
+TEST_F(FakeDockerTest, OwnerLabelsContainersAndKillLeftoversRemovesThem) {
+  DockerRuntimeOptions o = options();
+  o.owner = "n7";
+  // `before` plays a fleetlet that crashed with a container running;
+  // `after` is the next fleetlet of the same node.
+  DockerRuntime before(o);
+  ASSERT_TRUE(before.start(spec("fleet-1-1-aa")).ok);
+  ASSERT_TRUE(reap_until(before, [&] { return exists("fleet-1-1-aa"); }));
+  const auto runs = calls("run");
+  ASSERT_EQ(runs.size(), 1u);
+  EXPECT_NE(std::find(runs[0].begin(), runs[0].end(), "--label=fleet.owner=n7"), runs[0].end());
+
+  DockerRuntime after(o);
+  EXPECT_EQ(after.kill_leftovers(), 1u);
+  EXPECT_FALSE(exists("fleet-1-1-aa"));
+  const auto ps = calls("ps");
+  ASSERT_EQ(ps.size(), 1u);
+  EXPECT_EQ(ps[0], (Argv{"ps", "-aq", "--filter", "label=fleet.owner=n7"}));
+  // No owner: no label, and nothing is ever removed.
+  DockerRuntime anonymous(options());
+  EXPECT_EQ(anonymous.kill_leftovers(), 0u);
+  EXPECT_EQ(calls("ps").size(), 1u);
+}
+
 // ------------------------------------------------------- end to end, fake CLI
 
 TEST_F(FakeDockerTest, ImageAndOomTravelThroughMasterAndAgent) {
   MasterServerOptions mo;
   mo.listen_address = "127.0.0.1:0";
-  mo.schedule_interval = 50ms;
+  mo.tick_interval = 50ms;
   mo.core.heartbeat_interval_ms = 100;
+  // 3 s of silence before a node is dead, not the default 600 ms at this
+  // cadence: a slow sanitizer build must not have the node declared dead
+  // in the middle of a test about something else.
+  mo.core.suspect_after_missed = 10;
+  mo.core.dead_after_missed = 30;
   MasterServer master(mo);
   std::string err;
   ASSERT_TRUE(master.start(&err)) << err;

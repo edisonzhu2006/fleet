@@ -4,9 +4,10 @@
 // WHY THIS EXISTS. MasterCore is the logic; this class makes it a service.
 // It owns three things: the gRPC server (whose thread pool runs the RPC
 // handlers), one mutex that every handler takes around its MasterCore
-// call, and one scheduler thread that runs a scheduling pass every
-// `schedule_interval`, or immediately when a handler reports that
-// something changed (MasterCore::needs_schedule()).
+// call, and one tick thread that runs MasterCore::tick() (failure
+// detection, backoff timers, a scheduling pass) every `tick_interval`, or
+// immediately when a handler reports that something changed
+// (MasterCore::needs_schedule()).
 //
 // WHY ONE MUTEX AND NOT A SINGLE-THREADED EVENT LOOP. Both serialize
 // access to ClusterState; NOTES.md (m2) has the comparison. In short:
@@ -37,9 +38,11 @@ namespace fleet {
 struct MasterServerOptions {
   std::string listen_address = "127.0.0.1:7070";
   // The timer half of "on a timer and on events". Events cover every
-  // change m2 knows about; the timer is the backstop, and from m3 on it
-  // also drives failure detection.
-  std::chrono::milliseconds schedule_interval{200};
+  // change a handler makes; the timer is what notices silence (failure
+  // detection) and expired backoffs, so it bounds how late either is
+  // acted on: a node is declared dead at most one tick after its sixth
+  // missed heartbeat. 100 ms is a fifth of a heartbeat interval.
+  std::chrono::milliseconds tick_interval{100};
   MasterOptions core;
 };
 
@@ -56,8 +59,8 @@ class MasterServer {
   bool start(std::string* error);
   // The bound port (useful when listen_address ends in ":0").
   int port() const { return port_; }
-  // Stops accepting RPCs, finishes in-flight ones, joins the scheduler
-  // thread. Idempotent.
+  // Stops accepting RPCs, finishes in-flight ones, joins the tick thread.
+  // Idempotent.
   void shutdown();
 
   // Runs fn on the core under the lock. For tests and for fleetmaster's
@@ -66,16 +69,16 @@ class MasterServer {
 
  private:
   class Service;
-  void scheduler_loop();
+  void tick_loop();
 
   MasterServerOptions options_;
   std::mutex mu_;
-  std::condition_variable cv_;  // wakes the scheduler thread
+  std::condition_variable cv_;  // wakes the tick thread
   MasterCore core_;             // guarded by mu_
   bool stopping_ = false;       // guarded by mu_
   std::unique_ptr<Service> service_;
   std::unique_ptr<grpc::Server> server_;
-  std::thread scheduler_;
+  std::thread ticker_;
   int port_ = 0;
 };
 

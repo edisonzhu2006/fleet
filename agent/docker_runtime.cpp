@@ -72,6 +72,9 @@ std::string format_cpus(int64_t milli_cpu) {
 std::vector<std::string> docker_run_argv(const DockerRuntimeOptions& options,
                                          const LaunchSpec& spec) {
   std::vector<std::string> a = {options.docker, "run", "-d", "--name", spec.name, "--init"};
+  // One token (--label=k=v), so the label value can never be read as the
+  // image even if it were empty.
+  if (!options.owner.empty()) a.push_back("--label=fleet.owner=" + options.owner);
   // A zero request means "not limited" in that dimension, as in Docker
   // itself. The master never sends one (ClusterState::submit rejects
   // non-positive requests); this only matters for direct callers. Values
@@ -346,6 +349,26 @@ std::vector<ExitInfo> DockerRuntime::reap() {
   maybe_start_inspect(Clock::now());
   std::erase_if(background_, [](const std::unique_ptr<Subprocess>& p) { return p->poll(); });
   return exits;
+}
+
+size_t DockerRuntime::kill_leftovers() {
+  if (options_.owner.empty()) return 0;
+  // Blocking is fine here: this runs once, before the agent registers, so
+  // there is no heartbeat to delay yet.
+  std::string err;
+  auto ps = Subprocess::spawn({options_.docker, "ps", "-aq", "--filter",
+                               "label=fleet.owner=" + options_.owner},
+                              options_.command_timeout, &err);
+  if (!ps) return 0;
+  ps->wait();
+  if (!ps->result().ok()) return 0;  // daemon trouble: nothing learned
+  std::vector<std::string> argv = {options_.docker, "rm", "-f"};
+  std::istringstream ids(ps->result().out);
+  for (std::string id; ids >> id;) argv.push_back(id);
+  const size_t n = argv.size() - 3;
+  if (n == 0) return 0;
+  if (auto rm = Subprocess::spawn(argv, options_.command_timeout, &err)) rm->wait();
+  return n;
 }
 
 void DockerRuntime::kill_all() {

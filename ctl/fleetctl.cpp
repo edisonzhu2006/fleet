@@ -2,10 +2,16 @@
 //
 //   fleetctl [--master HOST:PORT] [--timeout-ms N] <command> ...
 //     submit --job J --cpu MILLICPU --mem MB [--priority 0..3] [--count N]
-//            [--label k=v]... [--image IMAGE] -- COMMAND [ARGS...]
+//            [--label k=v]... [--image IMAGE]
+//            [--restart never|on-failure|always] -- COMMAND [ARGS...]
 //     list [--job J]
 //     kill --task ID | --job J
 //     drain NODE
+//
+// drain returns once the master has marked the node draining; the tasks
+// then move over the next heartbeats (each is stopped where it runs and
+// rescheduled once its exit is reported). `list` shows the progress: the
+// node's TASKS column counts down to 0.
 //
 // Every call carries a deadline (--timeout-ms, default 3000), so a master
 // that is down makes fleetctl fail in bounded time with the gRPC status,
@@ -30,7 +36,8 @@ using fleet::v1::Master;
   std::fprintf(stderr,
                "usage: fleetctl [--master HOST:PORT] [--timeout-ms N] <command>\n"
                "  submit --job J --cpu MILLICPU --mem MB [--priority 0..3] [--count N]\n"
-               "         [--label k=v]... [--image IMAGE] -- COMMAND [ARGS...]\n"
+               "         [--label k=v]... [--image IMAGE]\n"
+               "         [--restart never|on-failure|always] -- COMMAND [ARGS...]\n"
                "  list [--job J]\n"
                "  kill --task ID | --job J\n"
                "  drain NODE\n");
@@ -62,7 +69,16 @@ const char* task_state(fleet::v1::TaskState s) {
     case fleet::v1::TASK_STATE_SUCCEEDED: return "succeeded";
     case fleet::v1::TASK_STATE_FAILED: return "failed";
     case fleet::v1::TASK_STATE_KILLED: return "killed";
+    case fleet::v1::TASK_STATE_BACKOFF: return "backoff";
     default: return "?";
+  }
+}
+
+const char* restart_policy(fleet::v1::RestartPolicy p) {
+  switch (p) {
+    case fleet::v1::RESTART_POLICY_ON_FAILURE: return "on-fail";
+    case fleet::v1::RESTART_POLICY_ALWAYS: return "always";
+    default: return "never";
   }
 }
 
@@ -74,12 +90,14 @@ void print_list(const fleet::v1::ListResponse& r) {
                             std::to_string(n.capacity().milli_cpu()) + "m";
     const std::string mem = std::to_string(n.allocated().memory_mb()) + "/" +
                             std::to_string(n.capacity().memory_mb()) + "MB";
+    // Suspect is shown in place of the state: it is the thing an operator
+    // needs to see first, and a suspect node is ready or draining anyway.
     std::printf("%-10s %-9s %-17s %-17s %5u %6lldms\n", n.name().c_str(),
-                node_state(n.state()), cpu.c_str(), mem.c_str(), n.running_tasks(),
-                static_cast<long long>(n.ms_since_heartbeat()));
+                n.suspect() ? "suspect" : node_state(n.state()), cpu.c_str(), mem.c_str(),
+                n.running_tasks(), static_cast<long long>(n.ms_since_heartbeat()));
   }
-  std::printf("\n%-4s %-10s %3s %-9s %-10s %3s %-10s %s\n", "ID", "JOB", "PRI", "STATE",
-              "NODE", "ATT", "EXIT", "COMMAND");
+  std::printf("\n%-4s %-10s %3s %-9s %-10s %3s %-10s %-7s %3s %s\n", "ID", "JOB", "PRI",
+              "STATE", "NODE", "ATT", "EXIT", "RESTART", "RST", "COMMAND");
   for (const auto& t : r.tasks()) {
     std::string exit = "-";
     if (t.has_exit()) {
@@ -93,9 +111,15 @@ void print_list(const fleet::v1::ListResponse& r) {
     // The image, when one was given, prefixes the command: "[alpine:3.20] sh -c ...".
     std::string cmd = t.image().empty() ? "" : "[" + t.image() + "]";
     for (const auto& a : t.argv()) cmd += (cmd.empty() ? "" : " ") + a;
-    std::printf("%-4u %-10s %3d %-9s %-10s %3u %-10s %s\n", t.id(), t.job().c_str(),
-                t.priority(), task_state(t.state()), t.node().empty() ? "-" : t.node().c_str(),
-                t.attempt(), exit.c_str(), cmd.c_str());
+    // A task in backoff shows how long until it is pending again.
+    std::string state = task_state(t.state());
+    if (t.state() == fleet::v1::TASK_STATE_BACKOFF) {
+      state += " " + std::to_string((t.restart_in_ms() + 999) / 1000) + "s";
+    }
+    std::printf("%-4u %-10s %3d %-9s %-10s %3u %-10s %-7s %3u %s\n", t.id(), t.job().c_str(),
+                t.priority(), state.c_str(), t.node().empty() ? "-" : t.node().c_str(),
+                t.attempt(), exit.c_str(), restart_policy(t.restart_policy()), t.restarts(),
+                cmd.c_str());
   }
 }
 
@@ -145,6 +169,16 @@ int main(int argc, char** argv) {
         req.set_count(static_cast<uint32_t>(std::stoul(v)));
       } else if (a == "--image") {
         req.set_image(v);
+      } else if (a == "--restart") {
+        if (v == "never") {
+          req.set_restart_policy(fleet::v1::RESTART_POLICY_NEVER);
+        } else if (v == "on-failure") {
+          req.set_restart_policy(fleet::v1::RESTART_POLICY_ON_FAILURE);
+        } else if (v == "always") {
+          req.set_restart_policy(fleet::v1::RESTART_POLICY_ALWAYS);
+        } else {
+          usage();
+        }
       } else if (a == "--label") {
         const size_t eq = v.find('=');
         if (eq == std::string::npos) usage();
@@ -196,7 +230,7 @@ int main(int argc, char** argv) {
     fleet::v1::DrainResponse resp;
     grpc::Status s = stub->Drain(&ctx, req, &resp);
     if (!s.ok()) return fail(s);
-    std::printf("drained %s: %d task(s) back to pending\n", argv[i], resp.evicted_size());
+    std::printf("draining %s: %d task(s) to stop and move\n", argv[i], resp.moving_size());
     return 0;
   }
   usage();

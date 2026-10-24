@@ -5,8 +5,9 @@
 // what is good. One pass of schedule_pending() visits every pending task in
 // priority order (highest first, then oldest) and for each one:
 //
-//   1. Feasibility filter: nodes that are ready, carry the task's required
-//      labels, and have enough free CPU and memory right now.
+//   1. Feasibility filter: nodes that accept tasks (ready and not
+//      suspect), carry the task's required labels, and have enough free
+//      CPU and memory right now.
 //   2. Scoring: among feasible nodes, pick one by the configured Strategy.
 //      The default, best-fit, packs tightly: it chooses the node that will
 //      have the least room left on the task's dominant resource, so big

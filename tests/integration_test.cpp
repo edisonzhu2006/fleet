@@ -2,7 +2,9 @@
 // an ephemeral port, in-process Agents with ProcessRuntime running real
 // processes, and a generated client stub standing in for fleetctl. These
 // cover the m2 "done when": submit, run to completion, kill; plus drain,
-// preemption, agent restart (incarnation fencing) and deadlines.
+// preemption, agent restart (epoch fencing) and deadlines. m3 adds a node
+// dying (its tasks restart elsewhere), a partitioned node being fenced
+// when it comes back, and a restart policy rerunning a failing task.
 //
 // Timing: the master tells agents to heartbeat every 100 ms here (500 ms
 // in production) so each test finishes in about a second. Waits poll List
@@ -45,8 +47,16 @@ class ClusterTest : public ::testing::Test {
     fs::create_directories(root_);
     MasterServerOptions mo;
     mo.listen_address = "127.0.0.1:0";
-    mo.schedule_interval = 50ms;
+    mo.tick_interval = 50ms;
     mo.core.heartbeat_interval_ms = 100;
+    // 3 s of silence before a node is dead (30 beats at this cadence), not
+    // the production 6: under TSan a fork alone takes hundreds of ms and
+    // the agent forks on its heartbeat thread, so 600 ms would declare
+    // healthy nodes dead in tests about something else. The failover
+    // tests below rely on this value.
+    mo.core.suspect_after_missed = 10;
+    mo.core.dead_after_missed = 30;
+    mo.core.backoff = {100ms, 400ms, 10s};
     master_ = std::make_unique<MasterServer>(mo);
     std::string err;
     ASSERT_TRUE(master_->start(&err)) << err;
@@ -88,8 +98,10 @@ class ClusterTest : public ::testing::Test {
   }
 
   std::vector<uint32_t> submit(const std::string& job, int prio, int64_t mcpu,
-                               std::vector<std::string> argv, uint32_t count = 1) {
+                               std::vector<std::string> argv, uint32_t count = 1,
+                               v1::RestartPolicy policy = v1::RESTART_POLICY_UNSPECIFIED) {
     v1::SubmitRequest req;
+    req.set_restart_policy(policy);
     req.set_job(job);
     req.set_priority(prio);
     req.mutable_request()->set_milli_cpu(mcpu);
@@ -132,6 +144,26 @@ class ClusterTest : public ::testing::Test {
 
   bool wait_state(uint32_t id, v1::TaskState s) {
     return wait_for([&] { return task(id).state() == s; });
+  }
+
+  // The agent registered as `name` (agents keep their node id in stats).
+  Agent& agent_named(const std::string& name) {
+    const v1::ListResponse l = list();
+    for (auto& a : agents_) {
+      const Agent::Stats st = a->stats();
+      if (st.registered && l.nodes(static_cast<int>(st.node_id)).name() == name) return *a;
+    }
+    ADD_FAILURE() << "no agent " << name;
+    return *agents_.front();
+  }
+
+  v1::NodeInfo node(const std::string& name) {
+    const v1::ListResponse l = list();
+    for (const auto& n : l.nodes()) {
+      if (n.name() == name) return n;
+    }
+    ADD_FAILURE() << "no node " << name;
+    return {};
   }
 
   size_t running_processes() {
@@ -234,26 +266,36 @@ TEST_F(ClusterTest, DrainMovesTaskToAnotherNode) {
   req.set_node(first);
   v1::DrainResponse resp;
   ASSERT_TRUE(stub_->Drain(ctx().get(), req, &resp).ok());
-  ASSERT_EQ(resp.evicted_size(), 1);
+  ASSERT_EQ(resp.moving_size(), 1);
 
-  ASSERT_TRUE(wait_for([&] {
-    v1::TaskInfo t = task(ids[0]);
-    return t.state() == v1::TASK_STATE_RUNNING && t.node() != first && t.attempt() == 2;
-  }));
-  // The old copy is stopped and the new one started: one process total.
-  ASSERT_TRUE(wait_for([&] {
+  // Graceful drain (m3): the old copy is stopped before the new one is
+  // placed, so at no sample do both run. Sampling every 20 ms cannot prove
+  // that (MasterCore's unit test does, call by call), but before m3 the
+  // two overlapped for up to a heartbeat, which this would usually catch.
+  size_t both_seen = 0;
+  auto per_node = [&](size_t* on_first, size_t* on_second) {
     const v1::ListResponse l = list();
-    size_t on_first = 0, on_second = 0;
+    *on_first = *on_second = 0;
     for (auto& a : agents_) {
       const Agent::Stats st = a->stats();
       if (l.nodes(static_cast<int>(st.node_id)).name() == first) {
-        on_first += st.running;
+        *on_first += st.running;
       } else {
-        on_second += st.running;
+        *on_second += st.running;
       }
     }
-    return on_first == 0 && on_second == 1;
+  };
+  ASSERT_TRUE(wait_for([&] {
+    size_t on_first = 0, on_second = 0;
+    per_node(&on_first, &on_second);
+    if (on_first > 0 && on_second > 0) ++both_seen;
+    const v1::TaskInfo t = task(ids[0]);
+    return t.state() == v1::TASK_STATE_RUNNING && t.node() != first && t.attempt() == 2 &&
+           on_first == 0 && on_second == 1;
   }));
+  EXPECT_EQ(both_seen, 0u);
+  EXPECT_EQ(node(first).state(), v1::NODE_STATE_DRAINING);
+  EXPECT_EQ(node(first).running_tasks(), 0u);
 }
 
 TEST_F(ClusterTest, PreemptionOverTheWire) {
@@ -274,7 +316,7 @@ TEST_F(ClusterTest, PreemptionOverTheWire) {
   ASSERT_TRUE(wait_for([&] { return running_processes() == 1; }));
 }
 
-TEST_F(ClusterTest, AgentRestartRequeuesUnderNewIncarnation) {
+TEST_F(ClusterTest, AgentRestartRequeuesUnderNewEpoch) {
   add_agent("a");
   auto ids = submit("svc", 1, 1000, {"sleep", "30"});
   ASSERT_TRUE(wait_state(ids[0], v1::TASK_STATE_RUNNING));
@@ -292,6 +334,92 @@ TEST_F(ClusterTest, AgentRestartRequeuesUnderNewIncarnation) {
   }));
   ASSERT_TRUE(wait_for([&] { return running_processes() == 1; }));
   EXPECT_EQ(list().nodes_size(), 1);  // same node, not a new one
+}
+
+TEST_F(ClusterTest, DeadNodesTasksAreRescheduledElsewhere) {
+  add_agent("a");
+  add_agent("b");
+  ASSERT_TRUE(wait_for([&] { return list().nodes_size() == 2; }));
+  // 3 of 4 cores: at most one per node, so "elsewhere" is forced.
+  auto ids = submit("svc", 1, 3000, {"sleep", "30"});
+  ASSERT_TRUE(wait_state(ids[0], v1::TASK_STATE_RUNNING));
+  ASSERT_TRUE(wait_for([&] { return running_processes() == 1; }));
+  const std::string first = task(ids[0]).node();
+
+  // The machine dies: its agent stops heartbeating and its task is gone
+  // with it (a clean agent stop kills its tasks, as a dead machine would).
+  Agent& doomed = agent_named(first);
+  const auto t0 = std::chrono::steady_clock::now();
+  doomed.request_stop();
+  doomed.join();
+  ASSERT_TRUE(wait_for([&] {
+    const v1::TaskInfo t = task(ids[0]);
+    return t.state() == v1::TASK_STATE_RUNNING && t.node() != first && t.attempt() == 2;
+  }));
+  const auto took = std::chrono::steady_clock::now() - t0;
+  // Rescheduled by the failure detector: 30 missed 100 ms heartbeats, so
+  // not before ~2.9 s of silence (the last beat came up to 100 ms before
+  // the stop).
+  EXPECT_GE(took, 2800ms);
+  const v1::NodeInfo dead = node(first);
+  EXPECT_EQ(dead.state(), v1::NODE_STATE_DEAD);
+  EXPECT_EQ(dead.epoch(), 0u);
+  EXPECT_EQ(dead.running_tasks(), 0u);
+  EXPECT_EQ(task(ids[0]).restarts(), 0u);  // a node loss is not the task's failure
+  ASSERT_TRUE(wait_for([&] { return running_processes() == 1; }));
+}
+
+TEST_F(ClusterTest, PartitionedNodeIsFencedWhenItComesBack) {
+  add_agent("a");
+  add_agent("b");
+  ASSERT_TRUE(wait_for([&] { return list().nodes_size() == 2; }));
+  auto ids = submit("svc", 1, 3000, {"sleep", "30"});
+  ASSERT_TRUE(wait_state(ids[0], v1::TASK_STATE_RUNNING));
+  ASSERT_TRUE(wait_for([&] { return running_processes() == 1; }));
+  const std::string first = task(ids[0]).node();
+  const uint64_t old_epoch = node(first).epoch();
+  Agent& cut_off = agent_named(first);
+
+  // Cut the node off. The master declares it dead and restarts the task
+  // on the other node...
+  cut_off.set_partitioned(true);
+  ASSERT_TRUE(wait_for([&] {
+    const v1::TaskInfo t = task(ids[0]);
+    return t.state() == v1::TASK_STATE_RUNNING && t.node() != first && t.attempt() == 2;
+  }));
+  ASSERT_TRUE(wait_for([&] { return running_processes() == 2; }));
+  // ...while the partitioned agent, which cannot know, still runs its
+  // copy: the window that epochs alone cannot close (NOTES.md m3).
+  EXPECT_EQ(cut_off.stats().running, 1u);
+  EXPECT_EQ(node(first).state(), v1::NODE_STATE_DEAD);
+
+  // The partition heals. Its first heartbeat carries the revoked epoch,
+  // is refused, and the agent kills its copy, then registers again.
+  cut_off.set_partitioned(false);
+  ASSERT_TRUE(wait_for([&] { return cut_off.stats().fenced == 1; }));
+  ASSERT_TRUE(wait_for([&] { return node(first).state() == v1::NODE_STATE_READY; }));
+  EXPECT_GT(node(first).epoch(), old_epoch);
+  EXPECT_EQ(cut_off.stats().running, 0u);
+  EXPECT_EQ(running_processes(), 1u);
+  EXPECT_EQ(task(ids[0]).node(), agents_[0].get() == &cut_off ? "b" : "a");
+}
+
+TEST_F(ClusterTest, OnFailureRestartsWithBackoffUntilTheTaskSucceeds) {
+  add_agent("a");
+  // Fails on its first two runs and succeeds on the third; the count lives
+  // in a file because each run is a new process.
+  const std::string counter = (root_ / "count").string();
+  auto ids = submit("flaky", 1, 500,
+                    {"/bin/sh", "-c",
+                     "n=$(cat " + counter + " 2>/dev/null || echo 0); n=$((n+1)); echo $n > " +
+                         counter + "; [ $n -ge 3 ]"},
+                    1, v1::RESTART_POLICY_ON_FAILURE);
+  ASSERT_TRUE(wait_state(ids[0], v1::TASK_STATE_SUCCEEDED));
+  const v1::TaskInfo t = task(ids[0]);
+  EXPECT_EQ(t.attempt(), 3u);
+  EXPECT_EQ(t.restarts(), 2u);
+  EXPECT_EQ(t.exit_code(), 0);
+  EXPECT_EQ(slurp(counter), "3\n");
 }
 
 TEST_F(ClusterTest, DeadlinesBoundCallsToADeadMaster) {

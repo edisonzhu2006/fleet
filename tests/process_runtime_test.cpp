@@ -2,7 +2,8 @@
 // are reported once, output lands in the log, a missing command fails at
 // start() rather than as exit 127, stop() kills the whole process group
 // (including a grandchild), SIGTERM is escalated to SIGKILL after the
-// grace period, and kill_all() leaves nothing behind.
+// grace period, kill_all() leaves nothing behind, and (m3) a new runtime
+// kills what an earlier one left running, but never a reused pid.
 
 #include <gtest/gtest.h>
 
@@ -10,6 +11,8 @@
 #include <csignal>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <unistd.h>
@@ -134,7 +137,9 @@ TEST_F(ProcessRuntimeTest, StopKillsWholeProcessGroup) {
 }
 
 TEST_F(ProcessRuntimeTest, EscalatesToSigkillAfterGrace) {
-  ProcessRuntime rt(ProcessRuntimeOptions{std::chrono::milliseconds(200), true});
+  ProcessRuntimeOptions o;
+  o.stop_grace = std::chrono::milliseconds(200);
+  ProcessRuntime rt(o);
   // Ignores SIGTERM; only SIGKILL ends it.
   StartResult r = rt.start(spec({"/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.05; done"}));
   ASSERT_TRUE(r.ok) << r.error;
@@ -177,6 +182,66 @@ TEST_F(ProcessRuntimeTest, TaskSeesDefaultSignalState) {
   auto exits = reap_n(rt, 1, 1500ms);  // well under the 2 s grace
   ASSERT_EQ(exits.size(), 1u);
   EXPECT_EQ(exits[0].signal, SIGTERM);
+}
+
+TEST_F(ProcessRuntimeTest, KillLeftoversKillsWhatAnEarlierRuntimeLeftRunning) {
+  // `before` plays the fleetlet that crashed: its task is still running
+  // and recorded in the state dir. `after` is the fleetlet started next on
+  // the same node, with the same state dir.
+  ProcessRuntimeOptions o;
+  o.state_dir = dir_ / "pids";
+  ProcessRuntime before(o);
+  StartResult r = before.start(spec({"/bin/sh", "-c", "sleep 30 & wait"}));
+  ASSERT_TRUE(r.ok) << r.error;
+  const pid_t pid = before.pid_of(r.handle);
+  ASSERT_TRUE(fs::exists(o.state_dir / std::to_string(pid)));
+
+  ProcessRuntime after(o);
+  EXPECT_EQ(after.kill_leftovers(), 1u);
+  // The whole group died of SIGKILL (the shell and its sleep), and the
+  // record is gone so a second call finds nothing.
+  auto exits = reap_n(before, 1);
+  ASSERT_EQ(exits.size(), 1u);
+  EXPECT_EQ(exits[0].signal, SIGKILL);
+  EXPECT_FALSE(fs::exists(o.state_dir / std::to_string(pid)));
+  EXPECT_EQ(after.kill_leftovers(), 0u);
+}
+
+TEST_F(ProcessRuntimeTest, KillLeftoversNeverKillsAReusedPid) {
+  // A record whose pid is alive but whose start time does not match: the
+  // pid was reused by some other process since the record was written.
+  ProcessRuntime other;  // records nothing (no state dir)
+  StartResult r = other.start(spec({"sleep", "30"}));
+  ASSERT_TRUE(r.ok) << r.error;
+  const pid_t pid = other.pid_of(r.handle);
+  const std::optional<uint64_t> started = process_start_time(pid);
+  ASSERT_TRUE(started.has_value());
+  const fs::path state = dir_ / "pids";
+  fs::create_directories(state);
+  std::ofstream(state / std::to_string(pid)) << pid << " " << (*started + 1) << "\n";
+  // And a record of a pid that does not exist at all.
+  std::ofstream(state / "999999") << 999999 << " " << 1 << "\n";
+
+  ProcessRuntimeOptions o;
+  o.state_dir = state;
+  ProcessRuntime after(o);
+  EXPECT_EQ(after.kill_leftovers(), 0u);
+  EXPECT_EQ(::kill(pid, 0), 0) << "an unrelated process was killed";
+  EXPECT_TRUE(other.reap().empty());
+  EXPECT_TRUE(fs::is_empty(state));  // stale records are cleaned up
+  other.kill_all();
+}
+
+TEST_F(ProcessRuntimeTest, RecordsAreRemovedWhenTasksExit) {
+  ProcessRuntimeOptions o;
+  o.state_dir = dir_ / "pids";
+  ProcessRuntime rt(o);
+  ASSERT_TRUE(rt.start(spec({"true"})).ok);
+  ASSERT_TRUE(rt.start(spec({"sleep", "30"}, "b.log")).ok);
+  ASSERT_EQ(reap_n(rt, 1).size(), 1u);
+  EXPECT_EQ(std::distance(fs::directory_iterator(o.state_dir), fs::directory_iterator{}), 1);
+  rt.kill_all();
+  EXPECT_TRUE(fs::is_empty(o.state_dir));
 }
 
 }  // namespace

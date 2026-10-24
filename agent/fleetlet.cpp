@@ -96,6 +96,11 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (opt.work_dir.empty()) opt.work_dir = "/private/tmp/fleet/" + opt.name;
+  // Leftover tracking (m3): ProcessRuntime records task pids under the
+  // node's own work dir; DockerRuntime labels containers with the node
+  // name. Either way a restarted fleetlet finds what a crashed one left.
+  rt.state_dir = opt.work_dir / "pids";
+  dk.owner = opt.name;
   if (runtime != "process" && runtime != "docker") {
     usage();
     return 2;

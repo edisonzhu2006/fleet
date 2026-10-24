@@ -15,10 +15,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
+#include <iterator>
+#include <sstream>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 extern char** environ;
 
@@ -45,7 +52,69 @@ constexpr char kNoMemLimit[] =
 
 }  // namespace
 
+std::optional<uint64_t> process_start_time(pid_t pid) {
+  if (pid <= 0) return std::nullopt;
+#if defined(__APPLE__)
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+  struct kinfo_proc kp {};
+  size_t len = sizeof(kp);
+  // No such pid: sysctl succeeds with len == 0.
+  if (::sysctl(mib, 4, &kp, &len, nullptr, 0) != 0 || len == 0) return std::nullopt;
+  const struct timeval& tv = kp.kp_proc.p_starttime;
+  return static_cast<uint64_t>(tv.tv_sec) * 1'000'000u + static_cast<uint64_t>(tv.tv_usec);
+#elif defined(__linux__)
+  // Field 22 of /proc/<pid>/stat. Field 2 is the command in parentheses
+  // and may itself contain spaces or ')', so count from the last ')'.
+  std::ifstream in("/proc/" + std::to_string(pid) + "/stat");
+  std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const size_t close = all.rfind(')');
+  if (close == std::string::npos) return std::nullopt;
+  std::istringstream rest(all.substr(close + 1));
+  std::string field;
+  for (int i = 3; i <= 22 && rest >> field; ++i) {
+    if (i == 22) return std::stoull(field);
+  }
+  return std::nullopt;
+#else
+  return std::nullopt;  // unknown platform: never match, so never kill
+#endif
+}
+
 ProcessRuntime::ProcessRuntime(ProcessRuntimeOptions options) : options_(options) {}
+
+void ProcessRuntime::record_pid(pid_t pid) const {
+  if (options_.state_dir.empty()) return;
+  const std::optional<uint64_t> started = process_start_time(pid);
+  if (!started) return;  // already gone
+  std::error_code ec;
+  std::filesystem::create_directories(options_.state_dir, ec);
+  std::ofstream(options_.state_dir / std::to_string(pid)) << pid << " " << *started << "\n";
+}
+
+void ProcessRuntime::forget_pid(pid_t pid) const {
+  if (options_.state_dir.empty()) return;
+  std::error_code ec;
+  std::filesystem::remove(options_.state_dir / std::to_string(pid), ec);
+}
+
+size_t ProcessRuntime::kill_leftovers() {
+  if (options_.state_dir.empty()) return 0;
+  std::error_code ec;
+  size_t killed = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(options_.state_dir, ec)) {
+    long long pid = 0;
+    unsigned long long started = 0;
+    std::ifstream in(entry.path());
+    if (in >> pid >> started && pid > 0) {
+      const auto now = process_start_time(static_cast<pid_t>(pid));
+      // Same pid AND same start time: the very process an earlier agent
+      // started. Anything else is a reused pid and is left alone.
+      if (now && *now == started && ::kill(static_cast<pid_t>(-pid), SIGKILL) == 0) ++killed;
+    }
+    std::filesystem::remove(entry.path(), ec);
+  }
+  return killed;
+}
 
 ProcessRuntime::~ProcessRuntime() { kill_all(); }
 
@@ -151,6 +220,7 @@ StartResult ProcessRuntime::start(const LaunchSpec& spec) {
     return r;
   }
 
+  record_pid(pid);
   const RuntimeHandle h = next_handle_++;
   procs_[h] = Proc{pid, false, {}};
   r.ok = true;
@@ -185,6 +255,7 @@ bool ProcessRuntime::try_collect(RuntimeHandle h, Proc& p, bool block, ExitInfo*
   int status = 0;
   while (::waitpid(p.pid, &status, 0) < 0 && errno == EINTR) {
   }
+  forget_pid(p.pid);
   out->handle = h;
   if (WIFSIGNALED(status)) {
     out->signal = WTERMSIG(status);

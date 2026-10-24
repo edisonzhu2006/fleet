@@ -146,7 +146,7 @@ echo "outcomes as expected: crunch 6/6 ok, web 3/3 ok, ssd on n2, flaky exit 2, 
 
 echo
 echo "== events (master)"
-grep -E "preempted|drained|placed|killed" "$WORK/master.log" | sed 's/^/  /'
+grep -E "preempted|draining|moving|placed|killed" "$WORK/master.log" | sed 's/^/  /'
 
 echo
 echo "== placement-to-start latency (master 'placed' -> agent 'started', same task and attempt)"

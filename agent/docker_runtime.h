@@ -86,6 +86,13 @@ struct DockerRuntimeOptions {
   // kill_all(): how long an in-flight docker run may finish before it is
   // killed (see kill_all for why it is not killed at once).
   std::chrono::milliseconds shutdown_wait{5000};
+  // The node that owns these containers (m3). When set, every container
+  // gets the label fleet.owner=<owner>, and kill_leftovers() removes all
+  // containers carrying it: what an earlier, crashed fleetlet of the same
+  // node left behind. A label and not the fleet- name prefix, because
+  // several nodes can share one Docker daemon (the bench and tests do) and
+  // must not remove each other's containers. fleetlet passes its --name.
+  std::string owner;
 };
 
 // Docker's --cpus value for a milli-CPU request, exactly, with no
@@ -119,6 +126,7 @@ class DockerRuntime final : public Runtime {
   std::vector<ExitInfo> reap() override;
   // Removes every container this runtime started (docker rm -f) and waits.
   void kill_all() override;
+  size_t kill_leftovers() override;
   size_t live_count() const override { return containers_.size(); }
 
  private:

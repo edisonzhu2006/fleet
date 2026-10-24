@@ -116,7 +116,7 @@ TEST(ClusterState, LabelValueMustMatch) {
   EXPECT_FALSE(ClusterState::labels_match({{"a", "1"}, {"c", "3"}}, {{"a", "1"}}));
 }
 
-TEST(ClusterState, DeadOrDrainingNodeReturnsTasksToPending) {
+TEST(ClusterState, DeadNodeReturnsTasksToPendingDrainingKeepsThem) {
   ClusterState st;
   NodeId a = st.add_node({4000, 4096});
   NodeId b = st.add_node({4000, 4096});
@@ -134,8 +134,15 @@ TEST(ClusterState, DeadOrDrainingNodeReturnsTasksToPending) {
   EXPECT_EQ(st.node(a).allocated, (Resources{}));
   EXPECT_TRUE(st.tasks_on(a).empty());
   EXPECT_INVARIANTS(st);
+  // Draining (m3) leaves the task where it runs: the master moves it with
+  // requeue() once the agent reports it stopped. No new placements there.
   st.set_node_state(b, NodeState::kDraining);
-  EXPECT_EQ(st.task(t3).state, TaskState::kPending);
+  EXPECT_EQ(st.task(t3).state, TaskState::kRunning);
+  EXPECT_FALSE(st.place(t1, b));
+  EXPECT_INVARIANTS(st);
+  EXPECT_TRUE(st.requeue(t3));
+  EXPECT_FALSE(st.requeue(t3));  // not running any more
+  EXPECT_EQ(st.task(t3).preempted_count, 0u);  // a move is not a preemption
   EXPECT_EQ(st.pending().size(), 3u);
   EXPECT_INVARIANTS(st);
 }

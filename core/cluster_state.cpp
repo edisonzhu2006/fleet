@@ -30,6 +30,7 @@ std::string_view to_string(TaskState s) {
     case TaskState::kSucceeded: return "succeeded";
     case TaskState::kFailed: return "failed";
     case TaskState::kKilled: return "killed";
+    case TaskState::kBackoff: return "backoff";
   }
   return "?";
 }
@@ -54,16 +55,16 @@ NodeId ClusterState::add_node(Resources capacity, Labels labels) {
 void ClusterState::set_node_state(NodeId id, NodeState state) {
   Node& n = nodes_.at(id);
   n.state = state;
-  if (state == NodeState::kReady) return;
-  // Copy the set: releasing erases from on_node_[id] while we iterate.
-  // Requeue directly instead of calling evict(): losing a node is not a
-  // preemption, so preempted_count (a signal about priority churn) must
-  // not be bumped. Quota stays charged, as with eviction: the task is alive.
+  if (state != NodeState::kDead) return;
+  // Copy the set: requeue() erases from on_node_[id] while we iterate.
+  // requeue(), not evict(): losing a node is not a preemption, so
+  // preempted_count (a signal about priority churn) is not bumped.
   const std::set<TaskId> running = on_node_[id];
-  for (TaskId t : running) {
-    release_from_node(tasks_[t]);
-    enqueue_pending(tasks_[t]);
-  }
+  for (TaskId t : running) requeue(t);
+}
+
+void ClusterState::set_node_suspect(NodeId id, bool suspect) {
+  nodes_.at(id).suspect = suspect;
 }
 
 void ClusterState::set_quota(const std::string& job, Resources limit) {
@@ -121,7 +122,7 @@ bool ClusterState::labels_match(const Labels& required, const Labels& have) {
 }
 
 bool ClusterState::feasible(const Task& task, const Node& node) const {
-  return node.state == NodeState::kReady &&
+  return node.accepts_tasks() &&
          task.request.fits_in(node.free()) &&
          labels_match(task.required_labels, node.labels);
 }
@@ -149,6 +150,32 @@ bool ClusterState::evict(TaskId task_id) {
   return true;
 }
 
+bool ClusterState::requeue(TaskId task_id) {
+  if (task_id >= tasks_.size()) return false;
+  Task& t = tasks_[task_id];
+  if (t.state != TaskState::kRunning) return false;
+  release_from_node(t);
+  enqueue_pending(t);  // quota stays charged: the task is still alive
+  return true;
+}
+
+bool ClusterState::enter_backoff(TaskId task_id) {
+  if (task_id >= tasks_.size()) return false;
+  Task& t = tasks_[task_id];
+  if (t.state != TaskState::kRunning) return false;
+  release_from_node(t);
+  t.state = TaskState::kBackoff;  // not queued: the master's timer requeues it
+  return true;
+}
+
+bool ClusterState::leave_backoff(TaskId task_id) {
+  if (task_id >= tasks_.size()) return false;
+  Task& t = tasks_[task_id];
+  if (t.state != TaskState::kBackoff) return false;
+  enqueue_pending(t);
+  return true;
+}
+
 bool ClusterState::finish(TaskId task_id, bool succeeded) {
   if (task_id >= tasks_.size()) return false;
   Task& t = tasks_[task_id];
@@ -166,7 +193,7 @@ bool ClusterState::kill(TaskId task_id) {
     release_from_node(t);
   } else if (t.state == TaskState::kPending) {
     pending_.erase(PendingKey{-t.priority, t.id});
-  } else {
+  } else if (t.state != TaskState::kBackoff) {
     return false;  // already terminal
   }
   t.state = TaskState::kKilled;
@@ -208,9 +235,8 @@ std::string ClusterState::check_invariants() const {
       const Node& n = nodes_[*t.node];
       alloc[n.id] += t.request;
       ++count[n.id];
-      if (n.state != NodeState::kReady) {
-        err << "task " << t.id << " running on " << to_string(n.state)
-            << " node " << n.id << "\n";
+      if (n.state == NodeState::kDead) {
+        err << "task " << t.id << " running on dead node " << n.id << "\n";
       }
       if (on_node_[n.id].count(t.id) == 0) {
         err << "task " << t.id << " missing from node " << n.id

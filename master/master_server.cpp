@@ -1,5 +1,5 @@
 // MasterServer implementation: the gRPC service adapter (lock, call
-// MasterCore, wake the scheduler if needed) and the scheduler thread.
+// MasterCore, wake the tick thread if needed) and the tick thread.
 
 #include "master_server.h"
 
@@ -43,8 +43,8 @@ class MasterServer::Service final : public v1::Master::Service {
 
  private:
   // Every handler: lock, run, and if the call changed something the
-  // scheduler cares about, wake it so a submission is placed now rather
-  // than at the next tick. notify after unlocking so the woken thread does
+  // scheduler cares about, wake the tick thread so a submission is placed
+  // now rather than at the next tick. notify after unlocking so the woken thread does
   // not immediately block on the mutex we still hold.
   template <typename F>
   grpc::Status call(F&& f) {
@@ -82,7 +82,7 @@ bool MasterServer::start(std::string* error) {
     server_.reset();
     return false;
   }
-  scheduler_ = std::thread([this] { scheduler_loop(); });
+  ticker_ = std::thread([this] { tick_loop(); });
   return true;
 }
 
@@ -97,7 +97,7 @@ void MasterServer::shutdown() {
     stopping_ = true;
   }
   cv_.notify_all();
-  if (scheduler_.joinable()) scheduler_.join();
+  if (ticker_.joinable()) ticker_.join();
   server_.reset();
 }
 
@@ -106,19 +106,21 @@ void MasterServer::with_core(const std::function<void(MasterCore&)>& fn) {
   fn(core_);
 }
 
-void MasterServer::scheduler_loop() {
+void MasterServer::tick_loop() {
   std::unique_lock<std::mutex> lock(mu_);
   while (!stopping_) {
     // Wakes on the timer or on an event; the predicate guards against
     // spurious wakeups and against a notify that arrived before we waited.
-    cv_.wait_for(lock, options_.schedule_interval,
+    cv_.wait_for(lock, options_.tick_interval,
                  [this] { return stopping_ || core_.needs_schedule(); });
     if (stopping_) break;
-    // The pass runs under the lock. It is microseconds at this scale
-    // (NOTES.md m1: mean 2.4 us per decision on 100 nodes), so holding the
-    // lock is cheaper to reason about than copying state out and merging
-    // decisions back in.
-    core_.schedule();
+    // The tick runs under the lock. A scheduling pass is microseconds at
+    // this scale (NOTES.md m1: mean 2.4 us per decision on 100 nodes) and
+    // the detector is O(nodes), so holding the lock is cheaper to reason
+    // about than copying state out and merging decisions back in. `now`
+    // is read while holding the lock, so every heartbeat already recorded
+    // is stamped no later than the time this tick judges silence against.
+    core_.tick(Clock::now());
   }
 }
 

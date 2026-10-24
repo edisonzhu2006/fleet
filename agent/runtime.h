@@ -31,7 +31,7 @@ struct LaunchSpec {
   std::filesystem::path log_path; // stdout and stderr both go here
   // Container runtimes only (ProcessRuntime ignores both). image: empty
   // means the runtime's default. name: unique per instance, the agent
-  // builds it from (task, attempt, incarnation).
+  // builds it from (task, attempt, epoch).
   std::string image;
   std::string name;
 };
@@ -69,8 +69,16 @@ class Runtime {
   // Exits since the last call. Each handle is reported exactly once and is
   // invalid afterwards.
   virtual std::vector<ExitInfo> reap() = 0;
-  // Kill everything immediately and wait for it. For agent shutdown.
+  // Kill everything immediately and wait for it. For agent shutdown, and
+  // for fencing (m3): an agent whose epoch is revoked kills all its tasks.
   virtual void kill_all() = 0;
+  // Kill tasks left running by an earlier agent process on this node, one
+  // that crashed or was SIGKILLed and so never ran kill_all() (m3). Their
+  // master-side tasks were requeued when this node registered again, so
+  // without this they would run beside their replacements indefinitely,
+  // and no epoch can reach them: the new agent never knew them. Called
+  // once, before the first registration. Returns how many it killed.
+  virtual size_t kill_leftovers() = 0;
   virtual size_t live_count() const = 0;
 };
 

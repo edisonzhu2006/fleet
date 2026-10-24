@@ -63,8 +63,11 @@ using NodeId = uint32_t;
 using TaskId = uint32_t;
 
 enum class NodeState : uint8_t {
-  kReady,     // accepts new tasks
-  kDraining,  // operator is taking it out of service: no new tasks
+  kReady,     // accepts new tasks (unless suspect, see Node::suspect)
+  // Operator is taking it out of service: no new tasks. Its running tasks
+  // stay here until the master has stopped each one and moved it (m3
+  // graceful drain); ClusterState::requeue() moves them.
+  kDraining,
   kDead,      // failure detector gave up on it (m3): no tasks at all
 };
 
@@ -72,8 +75,13 @@ enum class TaskState : uint8_t {
   kPending,    // admitted, waiting for a node (new, preempted, or node lost)
   kRunning,    // placed on a node; its request is counted in node.allocated
   kSucceeded,  // terminal: exited 0
-  kFailed,     // terminal: exited non-zero (restart policy is m3)
+  kFailed,     // terminal: exited non-zero and its restart policy said stop
   kKilled,     // terminal: user killed it
+  // Exited, and its restart policy will run it again once a backoff delay
+  // passes (m3). On no node and not in the pending queue, but alive: its
+  // quota stays charged. The master owns the timer; ClusterState only
+  // knows the state.
+  kBackoff,
 };
 
 // Job names: [A-Za-z0-9._-]{1,64}, and not "." or "..". They end up in
@@ -133,12 +141,20 @@ struct Node {
   Resources capacity;
   Labels labels;
   NodeState state = NodeState::kReady;
+  // The failure detector has not heard from it for a while (m3). Not a
+  // NodeState because it is orthogonal: a ready or a draining node can be
+  // suspect, and a suspect node keeps its tasks (it may only be slow). It
+  // only stops new placements, so no work is added to a node that may be
+  // about to be declared dead.
+  bool suspect = false;
   // Sum of the requests of the tasks running here. Maintained incrementally
   // by ClusterState on every place/evict/finish so the scheduler reads it in
   // O(1); check_invariants() recomputes it from scratch to catch drift.
   Resources allocated;
 
   Resources free() const { return capacity - allocated; }
+  // May the scheduler place (or preempt for) a task here?
+  bool accepts_tasks() const { return state == NodeState::kReady && !suspect; }
 };
 
 // What a user submits. Separate from Task so that admission can validate a

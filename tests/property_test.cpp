@@ -1,7 +1,7 @@
 // Property test: thousands of random operations (submit, schedule, finish,
 // kill, evict, direct place, node drain/death/recovery, new nodes, quota
-// changes) from a fixed seed, with check_invariants() after every single
-// one. Where the unit tests check specific scenarios, this checks that no
+// changes, and from m3 requeue, backoff in and out, suspect flags) from a
+// fixed seed, with check_invariants() after every single one. Where the unit tests check specific scenarios, this checks that no
 // interleaving of operations can make the bookkeeping drift, overcommit a
 // node, leave a task on a dead node, or preempt equal or higher priority.
 
@@ -44,6 +44,7 @@ struct Counters {
   int submits = 0, rejected = 0, passes = 0, placements = 0, preemptions = 0;
   int finishes = 0, kills = 0, evictions = 0, direct_places = 0;
   int node_changes = 0;
+  int requeues = 0, backoffs = 0, suspect_flips = 0;  // m3 transitions
 };
 
 Counters run_random_ops(uint64_t seed, int ops) {
@@ -82,13 +83,29 @@ Counters run_random_ops(uint64_t seed, int ops) {
         EXPECT_LT(st.task(p.victim).priority, st.task(p.preemptor).priority)
             << "op " << op;
       }
-    } else if (kind < 65) {
+    } else if (kind < 59) {
       if (random_task(st, rnd, TaskState::kRunning, t)) {
         EXPECT_TRUE(st.finish(t, rnd(4) != 0));
         ++c.finishes;
       }
+    } else if (kind < 65) {
+      // m3: a running task is moved (drain), or exits into backoff, and a
+      // task in backoff becomes pending again.
+      const uint64_t which = rnd(3);
+      if (which == 0 && random_task(st, rnd, TaskState::kRunning, t)) {
+        EXPECT_TRUE(st.requeue(t));
+        ++c.requeues;
+      } else if (which == 1 && random_task(st, rnd, TaskState::kRunning, t)) {
+        EXPECT_TRUE(st.enter_backoff(t));
+        ++c.backoffs;
+      } else if (which == 2 && random_task(st, rnd, TaskState::kBackoff, t)) {
+        EXPECT_TRUE(st.leave_backoff(t));
+      }
     } else if (kind < 70) {
-      const TaskState s = rnd(2) ? TaskState::kRunning : TaskState::kPending;
+      const uint64_t which = rnd(3);
+      const TaskState s = which == 0   ? TaskState::kRunning
+                          : which == 1 ? TaskState::kPending
+                                       : TaskState::kBackoff;
       if (random_task(st, rnd, s, t)) {
         EXPECT_TRUE(st.kill(t));
         ++c.kills;
@@ -107,9 +124,14 @@ Counters run_random_ops(uint64_t seed, int ops) {
         }
       }
     } else if (kind < 95) {
-      const NodeState s = static_cast<NodeState>(rnd(3));
-      st.set_node_state(static_cast<NodeId>(rnd(st.nodes().size())), s);
-      ++c.node_changes;
+      const NodeId n = static_cast<NodeId>(rnd(st.nodes().size()));
+      if (rnd(4) == 0) {
+        st.set_node_suspect(n, !st.node(n).suspect);
+        ++c.suspect_flips;
+      } else {
+        st.set_node_state(n, static_cast<NodeState>(rnd(3)));
+        ++c.node_changes;
+      }
     } else if (kind < 98) {
       if (st.nodes().size() < 24) {
         st.add_node({static_cast<int64_t>(4000 + 4000 * rnd(4)),
@@ -145,11 +167,15 @@ TEST(Property, InvariantsHoldUnderRandomOperations) {
     EXPECT_GT(c.kills, 50) << "seed " << seed;
     EXPECT_GT(c.evictions, 50) << "seed " << seed;
     EXPECT_GT(c.node_changes, 100) << "seed " << seed;
+    EXPECT_GT(c.requeues, 30) << "seed " << seed;
+    EXPECT_GT(c.backoffs, 30) << "seed " << seed;
+    EXPECT_GT(c.suspect_flips, 30) << "seed " << seed;
     std::printf("seed %llu: %d submits (%d rejected), %d passes, %d placements, "
-                "%d preemptions, %d direct places, %d node state changes\n",
+                "%d preemptions, %d direct places, %d node state changes, "
+                "%d requeues, %d backoffs, %d suspect flips\n",
                 static_cast<unsigned long long>(seed), c.submits, c.rejected,
                 c.passes, c.placements, c.preemptions, c.direct_places,
-                c.node_changes);
+                c.node_changes, c.requeues, c.backoffs, c.suspect_flips);
   }
 }
 
