@@ -7,6 +7,20 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# gRPC and Protobuf (needed from m2 on) come prebuilt from anaconda on
+# Edison's Mac. Point find_package at it, and bake its lib dir into the
+# build rpath so test binaries find libgrpc++ etc. without DYLD_LIBRARY_PATH,
+# but only when the caller did not choose a prefix themselves, so CI and
+# other machines keep their own toolchains.
+if(EXISTS "$ENV{HOME}/anaconda3/lib/cmake/grpc")
+  if(NOT CMAKE_PREFIX_PATH)
+    set(CMAKE_PREFIX_PATH "$ENV{HOME}/anaconda3" CACHE STRING "" FORCE)
+  endif()
+  if(NOT CMAKE_BUILD_RPATH)
+    set(CMAKE_BUILD_RPATH "$ENV{HOME}/anaconda3/lib" CACHE STRING "" FORCE)
+  endif()
+endif()
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
@@ -42,7 +56,7 @@ if(FLEET_BUILD_TESTS)
 endif()
 
 # Each component owns its CMakeLists.txt. Libraries: fleet_core (model +
-# scheduler, pure), fleet_proto (wire format + sockets). Executables:
+# scheduler, pure), fleet_proto (gRPC/Protobuf stubs, m2). Executables:
 # fleetmaster, fleetlet, fleetctl, fleetsim. Tests: tests/*.cpp -> fleet_tests.
 foreach(dir core proto master agent ctl sim)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${dir}/CMakeLists.txt)

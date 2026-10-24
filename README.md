@@ -5,7 +5,15 @@ plane places tasks on nodes by CPU and memory, preempts lower-priority
 work, and when a node dies reschedules its tasks elsewhere, resuming
 streaming jobs from their last checkpoint.
 
-Status: under construction. See [docs/PLAN.md](docs/PLAN.md).
+Status: m1 done (core model and scheduler as a pure library, `fleetsim`
+simulator, placement-strategy comparison in [NOTES.md](NOTES.md)). m2
+(gRPC master, agents, CLI) is next. See [docs/PLAN.md](docs/PLAN.md).
+
+## Try the simulator
+
+```
+./build/bin/fleetsim --nodes 100 --tasks 5000 --compare --seeds 10
+```
 
 ## Build
 
