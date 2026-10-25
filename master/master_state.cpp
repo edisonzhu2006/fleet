@@ -137,8 +137,10 @@ std::string MasterState::apply_tasks_submitted(const v1::TasksSubmitted& r) {
   if (!r.request_id().empty() && submissions_.count(r.request_id())) {
     return "request id " + r.request_id() + " was already admitted";
   }
-  const TaskSpec spec{r.job(), r.priority(), from_proto(r.request()),
-                      from_proto(r.required_labels())};
+  TaskSpec spec{r.job(), r.priority(), from_proto(r.request()),
+                from_proto(r.required_labels())};
+  // A stateful task is never a preemption victim (core/model.h).
+  spec.preemptible = r.checkpoint_dir().empty();
   for (uint32_t i = 0; i < r.count(); ++i) {
     // MasterCore admitted the whole batch before logging it (validation
     // and quota), so a refusal here means the log does not match.
@@ -147,6 +149,8 @@ std::string MasterState::apply_tasks_submitted(const v1::TasksSubmitted& r) {
     TaskMeta m;
     m.argv.assign(r.argv().begin(), r.argv().end());
     m.image = r.image();
+    m.checkpoint_dir = r.checkpoint_dir();
+    m.resume_argv.assign(r.resume_argv().begin(), r.resume_argv().end());
     m.policy = *policy;
     tasks_.push_back(std::move(m));
   }
@@ -283,6 +287,8 @@ void MasterState::to_snapshot(v1::Snapshot* out) const {
     st->set_preempted_count(t.preempted_count);
     for (const std::string& a : m.argv) st->add_argv(a);
     st->set_image(m.image);
+    st->set_checkpoint_dir(m.checkpoint_dir);
+    for (const std::string& a : m.resume_argv) st->add_resume_argv(a);
     st->set_restart_policy(to_proto(m.policy));
     st->set_attempt(m.attempt);
     if (m.last_node) st->set_last_node(*m.last_node);
@@ -343,10 +349,13 @@ std::optional<MasterState> MasterState::from_snapshot(const v1::Snapshot& snap,
     t.state = *state;
     if (st.has_node()) t.node = st.node();
     t.preempted_count = st.preempted_count();
+    t.preemptible = st.checkpoint_dir().empty();  // derived, as in apply
     if (!s.cluster_.restore_task(t)) return fail("task " + std::to_string(i) + " does not fit");
     TaskMeta m;
     m.argv.assign(st.argv().begin(), st.argv().end());
     m.image = st.image();
+    m.checkpoint_dir = st.checkpoint_dir();
+    m.resume_argv.assign(st.resume_argv().begin(), st.resume_argv().end());
     m.policy = *policy;
     m.attempt = st.attempt();
     if (st.has_last_node()) m.last_node = st.last_node();

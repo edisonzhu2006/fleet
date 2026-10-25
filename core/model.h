@@ -164,6 +164,14 @@ struct TaskSpec {
   int priority = kPriorityNormal;
   Resources request;
   Labels required_labels;
+  // May the scheduler evict it to make room for higher-priority work?
+  // False for stateful tasks (m5): an evicted task goes back to pending at
+  // once while its old copy is still running until its node's next
+  // heartbeat delivers the stop, so it could start elsewhere before the old
+  // copy is gone. Harmless for a stateless task, but two copies of a
+  // checkpointing task would race on one checkpoint directory and one
+  // output file. NOTES.md m5 has the alternatives.
+  bool preemptible = true;
 };
 
 struct Task {
@@ -172,6 +180,7 @@ struct Task {
   int priority = kPriorityNormal;
   Resources request;
   Labels required_labels;
+  bool preemptible = true;  // TaskSpec::preemptible
   TaskState state = TaskState::kPending;
   std::optional<NodeId> node;  // set exactly when state == kRunning
   // How many times this task was evicted by preemption. Not needed for

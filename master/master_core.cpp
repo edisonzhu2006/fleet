@@ -34,6 +34,35 @@ int64_t measure_wall_offset_ms() {
          ms(steady.time_since_epoch());
 }
 
+// Admission rules for a stateful task (m5); "" when the spec is fine.
+std::string check_stateful_spec(const v1::SubmitRequest& req, uint32_t count) {
+  const std::string& dir = req.checkpoint_dir();
+  // Absolute: the agent's working directory is not the submitter's, and a
+  // relative path would name a different directory on every node.
+  if (dir.front() != '/') return "checkpoint dir must be an absolute path: '" + dir + "'";
+  // "/" itself: the agent keeps the attempt fence beside the directory
+  // (agent/stateful.h), and "/" has no beside.
+  if (dir == "/") return "checkpoint dir must not be /";
+  if (dir.size() > 1024) return "checkpoint dir longer than 1024 bytes";
+  // Any "." or ".." component is refused: the master compares directories
+  // as strings (one directory per live task, below), and /a/../b would
+  // dodge that check while naming the same place as /b.
+  for (size_t start = 1; start <= dir.size();) {
+    const size_t end = std::min(dir.find('/', start), dir.size());
+    const std::string_view part(dir.data() + start, end - start);
+    if (part == "." || part == "..") return "checkpoint dir must not contain . or ..: '" + dir + "'";
+    start = end + 1;
+  }
+  // A trailing '/' would make "/a/b/" and "/a/b" two different strings
+  // for one directory (the in-use check below compares strings).
+  if (dir.back() == '/') return "checkpoint dir must not end in '/'";
+  if (req.resume_argv().empty() || req.resume_argv(0).empty()) {
+    return "a stateful task needs a resume command (--resume-arg)";
+  }
+  if (count != 1) return "a stateful task must have count 1: one checkpoint dir per task";
+  return {};
+}
+
 }  // namespace
 
 // The scheduler's decisions, carried out as log records (see Actuator in
@@ -450,6 +479,10 @@ void MasterCore::reconcile_node(NodeId node, const std::set<TaskId>& reported,
     for (const std::string& a : m.argv) l->add_argv(a);
     to_proto(t.request, l->mutable_limits());
     l->set_image(m.image);
+    // Stateful (m5): the agent picks argv or resume_argv by looking at the
+    // checkpoint directory when it starts this attempt (agent/stateful.h).
+    l->set_checkpoint_dir(m.checkpoint_dir);
+    for (const std::string& a : m.resume_argv) l->add_resume_argv(a);
   }
 }
 
@@ -539,6 +572,15 @@ grpc::Status MasterCore::submit(const v1::SubmitRequest& req,
             "unknown restart policy " + std::to_string(req.restart_policy())};
   }
   const uint32_t count = req.count() == 0 ? 1 : req.count();
+  // Stateful tasks (m5). Checked at admission, like the image, so a bad
+  // spec is an error now and not a start failure on some node later.
+  if (!req.checkpoint_dir().empty()) {
+    if (const std::string why = check_stateful_spec(req, count); !why.empty()) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, why};
+    }
+  } else if (!req.resume_argv().empty()) {
+    return {grpc::StatusCode::INVALID_ARGUMENT, "a resume command needs --checkpoint-dir"};
+  }
   // A retry of a submission already admitted (m4b): answer with its task
   // ids, admit nothing, log nothing. Checked before quota, so the retry
   // gets the first attempt's answer even if the quota has filled since.
@@ -555,6 +597,21 @@ grpc::Status MasterCore::submit(const v1::SubmitRequest& req,
       log("job " + req.job() + ": request " + req.request_id() +
           " already admitted; answered with its " + std::to_string(prior->count) + " task id(s)");
       return grpc::Status::OK;
+    }
+  }
+  // One checkpoint directory belongs to one live task: two tasks writing
+  // checkpoints into the same directory would corrupt each other's. Done
+  // after the retry check, so a retry of this very submission is answered
+  // above rather than refused here. A linear scan over all tasks: fine at
+  // fleet's scale (submissions are rare next to heartbeats); an index by
+  // directory would make it O(log n).
+  if (!req.checkpoint_dir().empty()) {
+    for (const Task& t : state_.cluster().tasks()) {
+      if (!is_terminal(t.state) && state_.task(t.id).checkpoint_dir == req.checkpoint_dir()) {
+        return {grpc::StatusCode::ALREADY_EXISTS,
+                "checkpoint dir " + req.checkpoint_dir() + " is in use by live task " +
+                    std::to_string(t.id) + " (" + t.job + ")"};
+      }
     }
   }
   if (count > options_.max_tasks_per_submit) {
@@ -587,6 +644,8 @@ grpc::Status MasterCore::submit(const v1::SubmitRequest& req,
   ts->set_image(req.image());
   ts->set_restart_policy(to_proto(*policy));
   ts->set_request_id(req.request_id());
+  ts->set_checkpoint_dir(req.checkpoint_dir());
+  *ts->mutable_resume_argv() = req.resume_argv();
   emit(std::move(r));
   for (uint32_t i = 0; i < count; ++i) resp->add_task_ids(first + i);
   needs_schedule_ = true;
@@ -631,6 +690,7 @@ grpc::Status MasterCore::list(const v1::ListRequest& req, v1::ListResponse* resp
     ti->set_message(m.message);
     ti->set_preempted_count(t.preempted_count);
     ti->set_image(m.image);
+    ti->set_checkpoint_dir(m.checkpoint_dir);
     ti->set_oom_killed(m.oom_killed);
     ti->set_restart_policy(to_proto(m.policy));
     ti->set_restarts(m.restarts);

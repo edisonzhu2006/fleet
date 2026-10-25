@@ -118,6 +118,7 @@ SubmitResult ClusterState::submit(const TaskSpec& spec) {
   t.priority = spec.priority;
   t.request = spec.request;
   t.required_labels = spec.required_labels;
+  t.preemptible = spec.preemptible;
   tasks_.push_back(std::move(t));
   enqueue_pending(tasks_.back());
   r.ok = true;

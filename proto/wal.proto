@@ -76,6 +76,9 @@ message TasksSubmitted {
   // a restart, knows the submission was admitted: a retry is answered
   // with these task ids instead of being admitted again.
   string request_id = 10;
+  // Stateful task (m5): SubmitRequest.checkpoint_dir and resume_argv.
+  string checkpoint_dir = 11;
+  repeated string resume_argv = 12;
 }
 
 // The scheduler placed a pending task. `attempt` is the attempt this
@@ -210,6 +213,8 @@ message SnapshotTask {
   int32 signal = 20;
   bool oom_killed = 21;
   string message = 22;
+  string checkpoint_dir = 23;     // m5
+  repeated string resume_argv = 24;
 }
 
 // A submission that carried a request id (m4b): its tasks are

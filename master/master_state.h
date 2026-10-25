@@ -72,6 +72,10 @@ struct NodeMeta {
 struct TaskMeta {
   std::vector<std::string> argv;
   std::string image;  // empty: the agent runtime's default
+  // Stateful task (m5): its checkpoint directory on shared storage and the
+  // command that continues from a checkpoint there. Empty dir: stateless.
+  std::string checkpoint_dir;
+  std::vector<std::string> resume_argv;
   RestartPolicy policy = RestartPolicy::kNever;
   uint32_t attempt = 0;  // 0 = never placed
   std::optional<NodeId> last_node;

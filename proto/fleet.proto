@@ -26,8 +26,8 @@
 //     into `reserved`;
 //   - every enum's zero value is UNSPECIFIED, because proto3 decodes an
 //     unknown or missing enum as 0 and that must not read as a real state.
-// Messages that will grow in later milestones (TaskLaunch gains a
-// checkpoint dir in m5) note where.
+// Messages that grew in later milestones note where (m5: the checkpoint
+// dir and resume command of stateful tasks).
 
 syntax = "proto3";
 
@@ -145,6 +145,18 @@ message TaskLaunch {
   // ProcessRuntime. An old agent ignores this field and runs argv as a
   // process, which is exactly the m2 behavior.
   string image = 5;
+  // Stateful tasks (m5). checkpoint_dir: where the task keeps its
+  // checkpoints, on storage every node can reach (one machine: a common
+  // directory). Empty: a stateless task, and the two fields below are
+  // unused. The agent, not the master, decides between the two command
+  // lines, because only the node can look at the checkpoint storage at
+  // the moment of the start: argv when there is no committed checkpoint
+  // (no MANIFEST in checkpoint_dir), resume_argv when there is one
+  // (agent/stateful.h). An old agent ignores these fields and always runs
+  // argv, which for streamkit starts over from byte 0 (correct, but loses
+  // the progress) or refuses because the directory holds state.
+  string checkpoint_dir = 6;
+  repeated string resume_argv = 7;
 }
 
 message HeartbeatResponse {
@@ -182,6 +194,12 @@ message SubmitRequest {
   // from "committed, then the leader died before replying" (both are
   // UNAVAILABLE), so without it a retry could admit the job twice.
   string request_id = 9;
+  // Stateful task (m5): see TaskLaunch.checkpoint_dir. Requires count 1
+  // (one checkpoint directory belongs to one task), an absolute path, and
+  // a non-empty resume_argv. A stateful task is never chosen as a
+  // preemption victim (NOTES.md m5 says why).
+  string checkpoint_dir = 10;
+  repeated string resume_argv = 11;
 }
 
 message SubmitResponse {
@@ -226,6 +244,7 @@ message TaskInfo {
   RestartPolicy restart_policy = 16;
   uint32 restarts = 17;   // times its restart policy has rerun it
   int64 restart_in_ms = 18;  // when BACKOFF: time left before it is pending again
+  string checkpoint_dir = 19;  // m5; empty for a stateless task
 }
 
 message ListResponse {

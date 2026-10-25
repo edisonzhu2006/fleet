@@ -1676,3 +1676,289 @@ instead of only when it hears a higher term).
   pass over the replicated build. The runs were started by the build
   session but were orphaned when it stalled, and were killed to free the
   machine. This is the first item for the review pass.
+
+## 2026-10-25: m5, stateful failover (streamkit jobs resume from checkpoints)
+
+**Problem.** Rescheduling a stateless task after its node dies is just
+"run it again somewhere". A streaming job is different: rerunning it from
+the start throws away its progress, and two copies of it running at once
+write into one checkpoint directory and one output file. m5 runs adstack's
+streamkit (a checkpointing stream aggregator) as fleet tasks, moves them
+off dead nodes, resumes them from their last checkpoint, and checks the
+final output against adstack's batch oracle.
+
+What was built:
+- A stateful task is a task with a `checkpoint_dir` (on storage every node
+  can reach; on one machine, a common directory) and a second command
+  line, `resume_argv` (for streamkit: the same flags plus `--resume`).
+  Both travel in `SubmitRequest`, `TasksSubmitted` (the replicated log
+  record), `SnapshotTask` and `TaskLaunch`. `fleetctl submit
+  --checkpoint-dir DIR --resume-arg --resume -- streamkit ...`.
+- Master (`master_core.cpp`): admission rules (absolute path, no `.` or
+  `..` components, no trailing `/`, count 1, a resume command required,
+  one live task per directory); stateful tasks are never preemption
+  victims (`TaskSpec::preemptible`, derived from the record on replay and
+  snapshot load, so it is not a second copy of state that can disagree).
+- Agent (`agent/stateful.{h,cpp}`): the start decision (fresh or resume,
+  from what the directory holds at the moment of the start) and the
+  attempt fence (a file beside the directory recording the newest
+  (task, attempt) started on it). `Agent::check_fences` re-reads the fence
+  of every running stateful attempt each heartbeat.
+- `bench/stateful_failover.sh`, results in
+  `bench/results/stateful_failover.txt`.
+
+**The agent, not the master, decides fresh vs resume.** Only the node can
+look at the checkpoint storage at the instant the process starts, so the
+master sends both command lines and the agent picks: argv when the
+directory is missing or empty, resume_argv otherwise. Alternatives: (1)
+the master decides from agent reports of what the directory holds. That
+report is stale by the time the start arrives (the old attempt may commit
+another epoch in between, or remove the directory on completion), and it
+puts storage knowledge in the control plane. (2) Always run the resume
+command. For streamkit that would work (`--resume` with no MANIFEST starts
+from byte 0), but not every program accepts a resume flag on its first
+run, and the log line "fresh" vs "resume, MANIFEST present" is what lets
+the bench count resumes. Cost: the agent does a directory listing before
+each stateful start (microseconds next to a process start).
+
+A directory with entries but no MANIFEST (an attempt died before its
+first commit, or while deleting the directory after completing) also gets
+the resume command, because by streamkit's contract `--resume` "continues
+from a MANIFEST if there is one, otherwise starts from byte 0", while a
+plain start refuses a directory that holds a previous run. The other
+choice, the agent deleting the leftovers and running argv, would teach
+fleet a task's file format and have fleet delete user data. In the bench
+it came up once in 139 starts in the first full run and 0 times in 120 in
+the final one, and that job passed; it is also covered by
+`StatefulDir.InspectSeesMissingEmptyCommittedAndLeftovers`.
+
+**Attempt fencing: two attempts of one task must never run at once.**
+Three layers, from the control plane down to the storage:
+1. *Attempt numbers come from the replicated log.* Every placement is a
+   `TaskPlaced` record carrying `attempt = previous + 1`, committed on a
+   Raft majority before the start is sent, so no two placements of a task
+   share a number and a later one always has a larger number, across
+   leader failovers.
+2. *The master places a stateful task again only when its old copy is
+   known to be stopped:* the old node was declared dead (its epoch is
+   revoked, so it will kill everything when it next talks to the master),
+   or it re-registered (a restarted fleetlet kills every leftover task
+   before registering, m3), or the task exited (drain moves it only after
+   its exit). It is never preempted: preemption puts the victim back to
+   pending at once while the old copy runs until its node's next
+   heartbeat delivers the stop, a window that is harmless for a stateless
+   task and exactly the forbidden overlap for a stateful one. A suspect
+   node (silent for 1.5 s) keeps its stateful tasks: being slow is not
+   evidence that the process stopped.
+   (`StatefulAttempts.PlacedAgainOnlyAfterTheOldNodeIsDeadAndAtAHigherAttempt`,
+   `AStatefulTaskIsNeverAPreemptionVictim`, `DrainMovesAStatefulTaskOnlyAfterItsExit`.)
+3. *The fence at the storage.* `<checkpoint dir>.fleet-fence` holds
+   "task <id> attempt <k>", the newest token that has started on the
+   directory. Before starting attempt k the agent takes an exclusive
+   `flock`, reads the token, refuses the start as "superseded" if the
+   recorded token is newer, otherwise writes its own token (F_FULLFSYNC,
+   so a power cut cannot bring back an older token) and starts. While the
+   attempt runs, every heartbeat re-reads the fence and stops the attempt
+   if a newer token appears. This is what covers a node that is cut off
+   from the master but still reaches the storage: the master cannot fence
+   it by epoch, but its replacement's start writes attempt k+1 into the
+   fence, and the cut-off agent stops attempt k within one heartbeat
+   (`ClusterTest.PartitionedNodesStatefulAttemptIsStoppedByTheFence`). The
+   token is (task id, attempt) compared in that order, so a directory
+   reused by a later submission outranks every attempt of the old task.
+   The fence lives beside the directory rather than in it because
+   streamkit deletes its directory when it completes.
+
+Why a token file and not a lock held for the attempt's lifetime (the
+agent keeping a flock open while the task runs): a lock held by a live
+but partitioned agent never releases, so the replacement would block
+forever, trading safety for a permanent outage; and flock semantics on
+network file systems (NFS, SMB) are unreliable, while a token compared on
+read only needs the storage to show the last write. The cost of the token
+scheme is the window it leaves (below).
+
+**What this does not give, and what a real system adds.** The fence is
+checked when an attempt starts and polled once per heartbeat; the task's
+own writes do not carry the token. So a cut-off node can run attempt k
+for up to one heartbeat (500 ms) beside attempt k+1, and a node that
+cannot reach the storage either keeps running until it reconnects. Two
+mechanisms close this in production systems:
+- *A lease on the checkpoint directory.* The attempt (or its agent) holds
+  a time-bounded lease from a lock service (Chubby, a ZooKeeper ephemeral
+  node, an etcd lease) and must renew it to keep running; the agent kills
+  the task when renewal fails, and the scheduler waits for the lease to
+  expire before starting a replacement. That turns "the master declared
+  the node dead" into "the old copy has provably stopped writing",
+  assuming bounded clock drift (rates, not absolute times). A local
+  version in fleet: the agent kills its stateful tasks after, say, 2 s
+  without a successful heartbeat, comfortably before the master's 3 s
+  death timeout.
+- *Storage-level fencing tokens.* Every write to the checkpoint storage
+  carries the attempt's token, and the storage rejects a token older than
+  the newest it has seen (Chubby sequencers, HDFS generation stamps,
+  GFS/Colossus chunk version numbers). Then even a process that is paused
+  for minutes and wakes up with a stale view cannot damage the newer
+  attempt's state, which no amount of checking on the client side can
+  guarantee. fleet cannot do this without changing streamkit, which m5
+  does not touch (adstack is used as an external binary).
+
+**Stateful tasks are not preemptible.** Alternatives: preempt with
+stop-then-move (the drain path: send the stop, wait for the exit, then
+place elsewhere), or let priority win and accept a restart from the last
+checkpoint. Stop-then-move is the right long-term answer; it was left out
+because it makes preemption two-phase (the high-priority task waits a
+stop grace period and a heartbeat for its room) and m5 is about failover.
+Cost of the choice: a low-priority stateful task can keep a high-priority
+task pending on a full cluster.
+
+**Completion is at least once, and that is fine for streamkit.** The bench
+caught a case the design had to tolerate: an attempt finished (committed
+its output by rename, removed its checkpoint directory, exited 0), and
+its node was killed before the agent reported the exit. The master,
+correctly, saw a task on a dead node and placed attempt k+1, which found
+no checkpoint directory, started fresh, and committed identical
+output over the first. That happened 5 times in the first full run and 4
+in the final one. It is safe because streamkit's commit is an atomic
+rename and the rerun produces the same rows (each such job still passed
+the oracle comparison); a task whose completion has side effects would
+need the agent to record exits durably before acknowledging them, or the
+task to leave a completion marker the agent checks (a resumed run that
+sees "done" exits 0 at once).
+
+**A machine that sleeps.** The verification run was on a laptop with its
+lid closed, on battery, which macOS keeps in Maintenance Sleep with short
+DarkWake windows (`pmset -g log`: 140 sleep entries that day by 12:50). During
+each sleep every process here is frozen (a probe that only sleeps and
+reads the clock saw a 36.9 s gap, the same as a probe that writes), the
+master's steady clock keeps counting, and when the machine wakes the
+leader's first tick sees every node silent for tens of seconds and
+declares all three dead at once. Everything stayed correct (each agent is
+fenced on its next beat, kills its tasks and re-registers; the overlap
+check found no two attempts of a task running at once), but those are
+failovers fleet did not need, and in principle the first node back can
+start a replacement up to one heartbeat before a slower node notices the
+fence and stops the old attempt: the window described above. The bench
+therefore runs a stall probe and reports the timing samples a pause
+overlapped separately. The fix in fleet would be pause detection in the
+failure detector: a tick that arrives much later than the tick interval
+means the master itself was not running, so it cannot have observed
+anyone's silence, and the detector clocks should be reset as at a
+restart (m4). Not done in m5; noted for m6.
+
+### Measurements (Apple M5 Pro, 18 threads, APFS, Release build)
+
+`bench/stateful_failover.sh` (`bench/results/stateful_failover.txt`):
+adstack `gen --n 2000000 --seed 7` (2M events, 1% duplicates, 5% late),
+the oracle computed once (392,570 windows), 3 fleetmaster replicas (Raft,
+F_FULLFSYNC), 3 fleetlets (4 cores, 4 GB, ProcessRuntime, event logs).
+Each round submits 3 streamkit jobs (2 cores each, `--threads 2
+--lateness-s 60 --checkpoint-every-events 100000 --throttle-eps 150000`,
+about 14 s uninterrupted), then every 3 to 6 s kills a random node that
+runs at least one job (SIGSTOP the fleetlet, SIGKILL every task's process
+group, SIGKILL the fleetlet) and restarts it 0.5 to 4 s later, one node
+down at a time, until all three jobs finish; each output is compared with
+the oracle by adstack's `bench/compare.sh`.
+
+Two full runs. The first exposed the case the final script now
+classifies (below); the second, with the committed script, is
+`bench/results/stateful_failover.txt`. Both on the same laptop with its
+lid closed on battery, so both include machine pauses.
+
+| outcome | run 1 (started 12:57) | run 2, final (started 13:27) |
+|---|---|---|
+| jobs identical to the oracle (`compare.sh` PASS) | 30 of 30 | 30 of 30 |
+| node kills (fleetlet and its tasks) | 98 | 76 |
+| attempts started | 139: 35 fresh, 103 from a MANIFEST, 1 over uncommitted leftovers | 120: 35 fresh, 85 from a MANIFEST, 0 over leftovers |
+| failovers (attempts after the first) | 109 | 90 |
+| streamkit runs completed / lost with their node before the exit was reported | 35 / 5 | 34 / 4 |
+| starts refused or attempts stopped by the fence | 0 | 0 |
+| attempts checked for overlap / overlapping | 139 / 0 | 120 / 0 |
+| checkpoint dirs left behind | 0 | 0 |
+| nodes declared dead | 63 | 56 |
+| machine pauses over 500 ms (stall probe) | 13, 1,027.9 s in total | 10, 1,778.3 s in total |
+| wall time | 1,541 s | 2,218 s |
+| load average at start / end | 1.94 2.49 3.93 / 2.64 2.88 3.49 | 30.22 11.61 6.72 (right after a clean rebuild) / 2.28 4.67 5.09 |
+
+Kill to replacement attempt started on another node (or on the same node
+after it came back), per (kill, task on the killed node), in ms:
+
+| how the master learned | run 1: n, min / median / max | run 2: n, min / median / max |
+|---|---|---|
+| all samples no machine pause overlapped | 106, 845 / 2,657 / 4,527 | 88, 1,028 / 2,465 / 6,261 |
+| node restarted and re-registered before it was declared dead | 65, 845 / 2,035 / 4,527 | 58, 1,028 / 2,052 / 6,261 |
+| declared dead first | 41, 2,592 / 2,983 / 3,472 | 30, 2,574 / 3,067 / 3,496 |
+| overlapped by a machine pause (excluded above) | 4, 2,608 / 107,848 / 149,135 | 3, 89,256 / 283,429 / 497,611 |
+
+How the times follow. Declared dead: 6 missed heartbeats is 3 s after the
+node's last heartbeat, which came 0 to 500 ms before the kill, then the
+replacement node's next heartbeat (up to 500 ms) carries the start; so
+about 2.5 to 3.5 s, as measured. Re-registered first: the bench brings a
+node back 0.5 to 4 s after the kill, a restarted fleetlet's registration
+requeues its old tasks at once, and the start follows on a heartbeat, so
+the spread is wider and the median lower. The 6,261 ms maximum in run 2
+is two kills in a row: n2 was killed at 13:33:09.887, came back,
+re-registered and was given attempt 5 of task 7, and was killed again at
+13:33:12.916, 0.2 s later, before starting it; attempt 6 started on n3
+at 13:33:16.148. The excluded samples are the length of a sleep, not of
+anything fleet did. In run 1 the summary printed "MISSING replacement for
+1 pair": task 28 attempt 8 exited 0 at 13:23:19.163, the master recorded
+it succeeded at 13:23:19.596, and the kill at 13:23:19.648 was chosen
+from a task list taken just before. The final script counts that case as
+"finished just before the kill" (1 in run 2).
+
+Cost of a stateful start over a stateless one: a directory listing and
+one fence write with F_FULLFSYNC (about 3 ms here, m4's measurement),
+before the process starts. streamkit's own checkpoint cost is adstack's
+(its NOTES.md).
+
+A 1-round trial before both runs (12:24, load 6.76 6.45 6.13) also
+passed, with 10 kills, and is where the 33 s silence that led to the
+stall investigation first appeared.
+
+
+### Verification
+
+Tests: 23 new, in three files.
+- `tests/stateful_test.cpp` (11): the resume decision for every directory
+  state that can occur; what `inspect_checkpoint_dir` sees for missing,
+  empty, uncommitted and committed directories, and a file in the
+  directory's place; fence tokens order by task then attempt; the fence
+  allows newer and equal, refuses older; the file format round-trips and
+  rejects 12 malformed variants (signs, leading zeros, extra spaces,
+  overflow, trailing bytes); the fence path is beside the directory, not
+  in it; acquire on disk records newer attempts, refuses a stale one
+  without rewriting, re-grants an attempt its own record; a torn fence
+  file refuses every start; a missing or empty file is "no token"; 8
+  threads racing 64 shuffled attempts never grant an older attempt after
+  a newer one and the file ends at the newest.
+- `tests/stateful_master_test.cpp` (9, MasterCore with a fake clock):
+  admission refuses 8 bad specs and logs nothing; one live task per
+  directory, free again after it finishes; a retried submission is
+  answered, not refused as a duplicate directory; the launch carries the
+  directory and the resume command (and a stateless one carries
+  neither); both survive replay and snapshot, with `preemptible` derived;
+  a stateful task is never a preemption victim; it is placed again only
+  once its node is declared dead, at a higher attempt, and the old node's
+  epoch is refused when it returns; a report of an older attempt is
+  stopped, not adopted; drain moves it only after its exit.
+- `tests/integration_test.cpp` (3, real gRPC and processes): a stateful
+  task resumes on another node from the checkpoint its dead node's
+  attempt left (the resume command ran exactly once); a partitioned
+  node's attempt is stopped by the fence while the master cannot reach it,
+  and the node is fenced by epoch when it reconnects; a start older than
+  the fence is refused as superseded.
+
+| build | command | result | load average |
+|---|---|---|---|
+| Release | `ctest --test-dir build -j8 -E RaftSim` | 217 tests: 214 passed, 3 RealDocker skipped (no Docker needed for m5), 11.17 s | 2.21 2.71 3.38 |
+| TSan (RelWithDebInfo) | `cmake --build build-tsan --target fleet_tests`, then `fleet_tests --gtest_filter='Resume*:Fence*:StatefulDir*:Stateful*:ClusterTest.*Stateful*:ClusterTest.*Fence*:ClusterTest.*Superseded*'` | 24 tests (the 23 new plus `ClusterTest.PartitionedNodeIsFencedWhenItComesBack`, which the filter matches) passed, no ThreadSanitizer report, 15.2 s | 21.14 7.33 5.02 (the TSan build had just finished) |
+| Release, clean | `cmake --build build --target clean`, then `cmake --build build` (75 steps) | zero warnings in project code; the one warning is GoogleTest's own `-Wcharacter-conversion` in gtest-printers.h, as in m4 | |
+| Release bench | `bench/stateful_failover.sh` (twice, 10 rounds each) | PASS both; numbers above | above |
+| machine pauses | two perl probes for 120 s, one appending a line every 50 ms, one only sleeping; and `pmset -g log` | both probes stopped for the same 36.9 s, matching a logged Maintenance Sleep; `ioreg` showed `AppleClamshellState = Yes`, on battery | |
+
+Not run: the 30-block Raft simulation (m5 does not touch `raft/`; m4b
+ran it, 29.6 min) and ASan. After every run, `pgrep` for fleet_tests,
+fleetmaster, fleetlet, streamkit and ctest found nothing left behind.
+For clean failover timings without pauses, rerun the bench with the lid
+open on AC power; the correctness checks do not depend on it.
+

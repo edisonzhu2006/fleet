@@ -5,7 +5,7 @@ plane places tasks on nodes by CPU and memory, preempts lower-priority
 work, and when a node dies reschedules its tasks elsewhere, resuming
 streaming jobs from their last checkpoint.
 
-Status: m4b done. m1: core model and scheduler as a pure library,
+Status: m5 done. m1: core model and scheduler as a pure library,
 `fleetsim` simulator, placement-strategy comparison. m2: gRPC control
 plane (`proto/fleet.proto`), `fleetmaster`, `fleetlet` agents with a
 fork/exec `ProcessRuntime`, the `fleetctl` CLI, and a local 3-agent
@@ -49,8 +49,26 @@ reply waits until it is committed and a majority has confirmed the
 leader (ReadIndex), so an isolated leader cannot answer anyone.
 `bench/leader_failover.sh` SIGKILLs the leader 20 times mid-workload and
 then partitions it (numbers in NOTES.md m4b).
-Decisions and measurements are in [NOTES.md](NOTES.md). m5 (stateful
-jobs) is next. See [docs/PLAN.md](docs/PLAN.md).
+m5: stateful jobs. A task can carry a checkpoint directory on shared
+storage and a resume command; when it is restarted after its attempt
+died, the agent runs the resume command if the directory holds a
+checkpoint. Two attempts of one task are kept from running at once (the
+one window left, a cut-off node for up to one heartbeat, is in NOTES.md
+m5): attempt numbers
+come from the replicated log, the master re-places a stateful task only
+after its old node is declared dead or has re-registered (never by
+preemption), and an attempt fence file beside the checkpoint directory
+makes an agent refuse a start older than one already recorded and stop a
+running attempt once a newer one has started. `bench/stateful_failover.sh`
+runs adstack's streamkit as 3 stateful jobs over 10 rounds while killing
+nodes under them: in the final run, 30 of 30 jobs identical to the
+oracle across 76 node kills and 90 failovers (85 starts resumed from a
+checkpoint), no two attempts of a task ever running at once, and the
+replacement attempt started a median 2,465 ms after the kill (max
+6,261 ms, a node killed twice in a row; samples overlapped by the
+laptop sleeping are reported apart, NOTES.md m5).
+Decisions and measurements are in [NOTES.md](NOTES.md); m6 (scale and
+benchmarks) is next. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Run a local cluster
 
@@ -60,6 +78,7 @@ bench/node_failure.sh       # SIGKILL an agent 10 times: time to dead, time to r
 bench/master_failure.sh     # SIGKILL the master 20 times mid-workload: nothing lost, nothing doubled
 bench/wal_commit.sh         # sync latency, group commit vs per-record sync, replay vs snapshot
 bench/leader_failover.sh    # 3 replicas: SIGKILL the leader 20 times, then partition it
+bench/stateful_failover.sh  # streamkit jobs: kill nodes under them, outputs identical to the oracle
 ```
 
 Or by hand:
@@ -123,6 +142,24 @@ waiting out its backoff as `backoff Ns` with its restart count.
 
 CPU is in milli-CPU (1000 = one core), memory in MB. Task logs go to
 `/private/tmp/fleet/<node>/<job>.t<task>.a<attempt>.log`.
+
+## Run stateful jobs (m5)
+
+A stateful task names its checkpoint directory and how to resume; the
+resume command is the command followed by every `--resume-arg`:
+
+```
+./build/bin/fleetctl --master $M submit --job sk --cpu 2000 --mem 512 \
+    --checkpoint-dir /shared/ck-sk --resume-arg --resume -- \
+    ../adstack/build/bin/streamkit --in /shared/events.ads --out /shared/out-sk.csv \
+    --lateness-s 60 --ckpt-dir /shared/ck-sk --checkpoint-every-events 100000
+```
+
+The directory must be absolute, without `.` or `..`, used by one live task
+at a time, and the job must have `--count 1`. The agent keeps the attempt
+fence in `<checkpoint dir>.fleet-fence` ("task <id> attempt <k>"), and
+`fleetctl list` shows the directory as `{ckpt DIR}` before the command.
+
 
 ## Run tasks as containers
 

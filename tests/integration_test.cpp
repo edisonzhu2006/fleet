@@ -4,7 +4,10 @@
 // cover the m2 "done when": submit, run to completion, kill; plus drain,
 // preemption, agent restart (epoch fencing) and deadlines. m3 adds a node
 // dying (its tasks restart elsewhere), a partitioned node being fenced
-// when it comes back, and a restart policy rerunning a failing task.
+// when it comes back, and a restart policy rerunning a failing task. m5
+// adds stateful tasks: resumed on another node from the checkpoint the
+// dead node's attempt left, a partitioned node's attempt stopped by the
+// fence, and a stale start refused by it.
 //
 // Timing: the master tells agents to heartbeat every 100 ms here (500 ms
 // in production) so each test finishes in about a second. Waits poll List
@@ -30,6 +33,7 @@
 #include "fleet.grpc.pb.h"
 #include "master_server.h"
 #include "process_runtime.h"
+#include "stateful.h"
 
 namespace fleet {
 namespace {
@@ -112,6 +116,24 @@ class ClusterTest : public ::testing::Test {
     grpc::Status s = stub_->Submit(ctx().get(), req, &resp);
     EXPECT_TRUE(s.ok()) << s.error_message();
     return {resp.task_ids().begin(), resp.task_ids().end()};
+  }
+
+  // A stateful task (m5): argv for a first start, resume for a restart
+  // over a checkpoint directory that holds state.
+  uint32_t submit_stateful(const std::string& job, int64_t mcpu, const fs::path& dir,
+                           std::vector<std::string> argv, std::vector<std::string> resume) {
+    v1::SubmitRequest req;
+    req.set_job(job);
+    req.set_priority(1);
+    req.mutable_request()->set_milli_cpu(mcpu);
+    req.mutable_request()->set_memory_mb(64);
+    for (auto& a : argv) req.add_argv(a);
+    for (auto& a : resume) req.add_resume_argv(a);
+    req.set_checkpoint_dir(dir.string());
+    v1::SubmitResponse resp;
+    grpc::Status s = stub_->Submit(ctx().get(), req, &resp);
+    EXPECT_TRUE(s.ok()) << s.error_message();
+    return resp.task_ids_size() ? resp.task_ids(0) : 0;
   }
 
   v1::ListResponse list() {
@@ -452,6 +474,94 @@ TEST_F(ClusterTest, DeadlinesBoundCallsToADeadMaster) {
   lost.request_stop();
   lost.join();
   EXPECT_LT(std::chrono::steady_clock::now() - t1, 1s);
+}
+
+// ------------------------------------------------------- stateful tasks (m5)
+
+// A shell stand-in for streamkit: the first start "commits a checkpoint"
+// (writes MANIFEST) and runs until killed; the resume command proves it
+// saw the checkpoint and finishes. LOG records which command ran.
+TEST_F(ClusterTest, StatefulTaskResumesOnAnotherNodeAfterItsNodeDies) {
+  add_agent("a");
+  add_agent("b");
+  ASSERT_TRUE(wait_for([&] { return list().nodes_size() == 2; }));
+  const fs::path dir = root_ / "ckpt";
+  const std::string log = (root_ / "LOG").string();
+  const uint32_t id = submit_stateful(
+      "sk", 3000, dir,
+      {"/bin/sh", "-c",
+       "mkdir -p " + dir.string() + " && echo e1 > " + dir.string() + "/MANIFEST && echo fresh >> " +
+           log + " && exec sleep 30"},
+      {"/bin/sh", "-c", "test -f " + dir.string() + "/MANIFEST && echo resumed >> " + log});
+  ASSERT_TRUE(wait_state(id, v1::TASK_STATE_RUNNING));
+  ASSERT_TRUE(wait_for([&] { return slurp(log) == "fresh\n"; }));
+  const std::string first = task(id).node();
+
+  // The machine dies with its task (a clean agent stop kills its tasks).
+  Agent& doomed = agent_named(first);
+  doomed.request_stop();
+  doomed.join();
+  ASSERT_TRUE(wait_state(id, v1::TASK_STATE_SUCCEEDED));
+  const v1::TaskInfo t = task(id);
+  EXPECT_EQ(t.attempt(), 2u);
+  EXPECT_NE(t.node(), first);
+  EXPECT_EQ(t.checkpoint_dir(), dir.string());
+  // The resume command ran, exactly once, after the first start.
+  EXPECT_EQ(slurp(log), "fresh\nresumed\n");
+  EXPECT_EQ(slurp(fence_path(dir)), "task " + std::to_string(id) + " attempt 2\n");
+  EXPECT_EQ(agent_named(t.node()).stats().resumed, 1u);
+}
+
+TEST_F(ClusterTest, PartitionedNodesStatefulAttemptIsStoppedByTheFence) {
+  add_agent("a");
+  add_agent("b");
+  ASSERT_TRUE(wait_for([&] { return list().nodes_size() == 2; }));
+  const fs::path dir = root_ / "ckpt";
+  const uint32_t id =
+      submit_stateful("sk", 3000, dir, {"sleep", "30"}, {"sleep", "30"});
+  ASSERT_TRUE(wait_state(id, v1::TASK_STATE_RUNNING));
+  ASSERT_TRUE(wait_for([&] { return running_processes() == 1; }));
+  const std::string first = task(id).node();
+  Agent& cut_off = agent_named(first);
+
+  // Cut off from the master (the checkpoint storage is still reachable).
+  // The master declares it dead and starts attempt 2 elsewhere; that start
+  // records attempt 2 in the fence, and the cut-off agent, still unable to
+  // hear from the master, sees it there and stops attempt 1 on its own.
+  // With epochs alone (the stateless PartitionedNodeIsFencedWhenItComesBack
+  // above) attempt 1 runs until the partition heals.
+  cut_off.set_partitioned(true);
+  ASSERT_TRUE(wait_for([&] {
+    const v1::TaskInfo t = task(id);
+    return t.state() == v1::TASK_STATE_RUNNING && t.node() != first && t.attempt() == 2;
+  }));
+  ASSERT_TRUE(wait_for([&] { return cut_off.stats().running == 0; }))
+      << "running " << cut_off.stats().running << ", superseded " << cut_off.stats().superseded;
+  EXPECT_EQ(cut_off.stats().superseded, 1u);
+  EXPECT_EQ(cut_off.stats().fenced, 0u);  // the master never got to say so
+  // Polled: the replacement's agent publishes its stats once per loop.
+  EXPECT_TRUE(wait_for([&] { return running_processes() == 1; })) << running_processes();
+  cut_off.set_partitioned(false);
+  ASSERT_TRUE(wait_for([&] { return cut_off.stats().fenced == 1; }));
+  EXPECT_EQ(task(id).attempt(), 2u);
+}
+
+TEST_F(ClusterTest, AStartOlderThanTheFenceIsRefusedAsSuperseded) {
+  add_agent("a");
+  ASSERT_TRUE(wait_for([&] { return list().nodes_size() == 1; }));
+  const fs::path dir = root_ / "ckpt";
+  // A newer task already started on this directory, as far as the
+  // storage knows (here: a task id this master has not issued).
+  {
+    std::ofstream(fence_path(dir)) << "task 4000000000 attempt 1\n";
+  }
+  const uint32_t id = submit_stateful("sk", 500, dir, {"true"}, {"true"});
+  ASSERT_TRUE(wait_state(id, v1::TASK_STATE_FAILED));
+  const v1::TaskInfo t = task(id);
+  EXPECT_NE(t.message().find("superseded"), std::string::npos) << t.message();
+  EXPECT_EQ(slurp(fence_path(dir)), "task 4000000000 attempt 1\n");  // untouched
+  EXPECT_EQ(agent_named("a").stats().superseded, 1u);
+  EXPECT_EQ(running_processes(), 0u);
 }
 
 }  // namespace

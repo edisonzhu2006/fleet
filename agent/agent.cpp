@@ -5,6 +5,7 @@
 
 #include "leader_redirect.h"
 #include "log.h"
+#include "stateful.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -130,6 +131,8 @@ void Agent::publish_stats() {
   stats_.heartbeats_failed = hb_failed_;
   stats_.started = started_;
   stats_.fenced = fenced_;
+  stats_.resumed = resumed_;
+  stats_.superseded = superseded_;
 }
 
 void Agent::log(const std::string& line) const {
@@ -199,6 +202,12 @@ void Agent::run() {
     const auto now = std::chrono::steady_clock::now();
     if (now >= next_beat) {
       const bool was_registered = registered_;
+      // Every beat, whether or not the master can be reached (m5): cut off
+      // from the master is exactly when the master cannot fence this node
+      // by epoch and has placed its stateful tasks elsewhere, and the
+      // checkpoint storage may still be reachable. Before the report, so
+      // an attempt stopped here is reported soon after.
+      check_fences();
       if (partitioned()) {
         ++hb_failed_;  // dropped by the (simulated) network
       } else if (!registered_) {
@@ -374,6 +383,19 @@ void Agent::launch(const v1::TaskLaunch& l) {
   }
   LaunchSpec spec;
   spec.argv.assign(l.argv().begin(), l.argv().end());
+  std::string stateful_note;
+  if (!l.checkpoint_dir().empty()) {
+    std::string why;
+    if (!prepare_stateful(l, key, &spec.argv, &stateful_note, &why)) {
+      inst.phase = v1::TaskStatus::PHASE_START_FAILED;
+      inst.message = why;
+      log("start of task " + std::to_string(key.task_id) + " attempt " +
+          std::to_string(key.attempt) + " refused: " + why);
+      instances_.emplace(key, inst);
+      return;
+    }
+    inst.checkpoint_dir = l.checkpoint_dir();
+  }
   spec.limits = Resources{l.limits().milli_cpu(), l.limits().memory_mb()};
   spec.log_path = options_.work_dir / (l.job() + ".t" + std::to_string(key.task_id) +
                                        ".a" + std::to_string(key.attempt) + ".log");
@@ -387,14 +409,87 @@ void Agent::launch(const v1::TaskLaunch& l) {
     by_handle_[r.handle] = key;
     ++started_;
     record_event("start", key, launched_at);
-    log("started task " + std::to_string(key.task_id) + " (" + l.job() +
-        ") attempt " + std::to_string(key.attempt) + ", log " + spec.log_path.string());
+    log("started task " + std::to_string(key.task_id) + " (" + l.job() + ") attempt " +
+        std::to_string(key.attempt) + stateful_note +
+        ", log " + spec.log_path.string());
   } else {
     inst.phase = v1::TaskStatus::PHASE_START_FAILED;
     inst.message = r.error;
     log("start of task " + std::to_string(key.task_id) + " failed: " + r.error);
   }
   instances_.emplace(key, inst);
+}
+
+bool Agent::prepare_stateful(const v1::TaskLaunch& l, const Key& key,
+                             std::vector<std::string>* argv, std::string* note,
+                             std::string* why) {
+  const std::filesystem::path dir = l.checkpoint_dir();
+  // The master validates the path; a path from the network that becomes a
+  // file name is checked again here (as job names are).
+  if (!dir.is_absolute() || dir == "/") {
+    *why = "checkpoint dir must be an absolute path other than /";
+    return false;
+  }
+  // 1. The fence, before looking at the directory: once a newer attempt
+  //    has started, this one must not even read state that attempt may be
+  //    rewriting.
+  const FenceToken mine{key.task_id, key.attempt};
+  const FenceResult f = fence_acquire(fence_path(dir), mine);
+  if (!f.error.empty()) {
+    *why = "attempt fence: " + f.error;
+    return false;
+  }
+  if (!f.granted) {
+    ++superseded_;
+    *why = "superseded: " + f.recorded->to_string() + " already started on " + dir.string() +
+           "; refusing " + mine.to_string();
+    return false;
+  }
+  // 2. Fresh or resume, by what is in the directory now.
+  std::string err;
+  const CheckpointDirState st = inspect_checkpoint_dir(dir, &err);
+  if (!err.empty()) {
+    *why = err;
+    return false;
+  }
+  const StartMode mode = decide_start_mode(st);
+  if (mode == StartMode::kResume) {
+    if (l.resume_argv().empty()) {
+      *why = "checkpoint dir holds state but the task has no resume command";
+      return false;
+    }
+    argv->assign(l.resume_argv().begin(), l.resume_argv().end());
+    ++resumed_;
+  }
+  *note = std::string(" [stateful: ") + to_string(mode) +
+                   (st.has_manifest ? ", MANIFEST present" : st.exists ? ", no MANIFEST" : "") +
+                   (f.recorded ? ", fence was " + f.recorded->to_string() : "") + "]";
+  return true;
+}
+
+void Agent::check_fences() {
+  for (auto& [key, inst] : instances_) {
+    if (inst.checkpoint_dir.empty() || inst.superseded ||
+        inst.phase != v1::TaskStatus::PHASE_RUNNING) {
+      continue;
+    }
+    std::string err;
+    const std::optional<FenceToken> t = fence_read(fence_path(inst.checkpoint_dir), &err);
+    if (!err.empty()) {
+      // Not proof of anything: the storage may be briefly unreachable.
+      // Leave the attempt running; the master's epoch fencing still holds.
+      log("cannot read the fence of task " + std::to_string(key.task_id) + ": " + err);
+      continue;
+    }
+    const FenceToken mine{key.task_id, key.attempt};
+    if (t && *t > mine) {
+      inst.superseded = true;
+      ++superseded_;
+      log("task " + std::to_string(key.task_id) + " attempt " + std::to_string(key.attempt) +
+          " superseded by " + t->to_string() + " on its checkpoint dir; stopping it");
+      runtime_->stop(inst.handle);
+    }
+  }
 }
 
 }  // namespace fleet

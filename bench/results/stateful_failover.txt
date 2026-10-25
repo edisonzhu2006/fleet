@@ -1,0 +1,65 @@
+== machine: Apple M5 Pro, load: 30.22 11.61 6.72
+== bin: /Users/edison.zhu/projects/fleet/build/bin   adstack: /Users/edison.zhu/projects/adstack/build/bin
+== input: 2000000 events, seed 7; oracle: 392570 windows
+== cluster: 3 replicas (leader 2), 3 nodes ready
+  round 1 sk-r1-1: succeeded, attempts 3, PASS: 392570 windows identical, ckpt dir removed
+  round 1 sk-r1-2: succeeded, attempts 2, PASS: 392570 windows identical, ckpt dir removed
+  round 1 sk-r1-3: succeeded, attempts 2, PASS: 392570 windows identical, ckpt dir removed
+  round 1: 3 node kill(s), 24 s, load 20.87 10.91 6.61
+  round 2 sk-r2-1: succeeded, attempts 1, PASS: 392570 windows identical, ckpt dir removed
+  round 2 sk-r2-2: succeeded, attempts 1, PASS: 392570 windows identical, ckpt dir removed
+  round 2 sk-r2-3: succeeded, attempts 9, PASS: 392570 windows identical, ckpt dir removed
+  round 2: 8 node kill(s), 128 s, load 11.55 9.82 6.42
+  round 3 sk-r3-1: succeeded, attempts 2, PASS: 392570 windows identical, ckpt dir removed
+  round 3 sk-r3-2: succeeded, attempts 7, PASS: 392570 windows identical, ckpt dir removed
+  round 3 sk-r3-3: succeeded, attempts 1, PASS: 392570 windows identical, ckpt dir removed
+  round 3: 6 node kill(s), 219 s, load 7.54 9.02 6.27
+  round 4 sk-r4-1: succeeded, attempts 3, PASS: 392570 windows identical, ckpt dir removed
+  round 4 sk-r4-2: succeeded, attempts 3, PASS: 392570 windows identical, ckpt dir removed
+  round 4 sk-r4-3: succeeded, attempts 1, PASS: 392570 windows identical, ckpt dir removed
+  round 4: 3 node kill(s), 49 s, load 5.56 8.40 6.14
+  round 5 sk-r5-1: succeeded, attempts 4, PASS: 392570 windows identical, ckpt dir removed
+  round 5 sk-r5-2: succeeded, attempts 11, PASS: 392570 windows identical, ckpt dir removed
+  round 5 sk-r5-3: succeeded, attempts 2, PASS: 392570 windows identical, ckpt dir removed
+  round 5: 11 node kill(s), 231 s, load 4.11 7.57 5.97
+  round 6 sk-r6-1: succeeded, attempts 4, PASS: 392570 windows identical, ckpt dir removed
+  round 6 sk-r6-2: succeeded, attempts 3, PASS: 392570 windows identical, ckpt dir removed
+  round 6 sk-r6-3: succeeded, attempts 4, PASS: 392570 windows identical, ckpt dir removed
+  round 6: 3 node kill(s), 98 s, load 3.86 7.23 5.90
+  round 7 sk-r7-1: succeeded, attempts 13, PASS: 392570 windows identical, ckpt dir removed
+  round 7 sk-r7-2: succeeded, attempts 4, PASS: 392570 windows identical, ckpt dir removed
+  round 7 sk-r7-3: succeeded, attempts 1, PASS: 392570 windows identical, ckpt dir removed
+  round 7: 13 node kill(s), 349 s, load 3.08 6.29 5.64
+  round 8 sk-r8-1: succeeded, attempts 8, PASS: 392570 windows identical, ckpt dir removed
+  round 8 sk-r8-2: succeeded, attempts 4, PASS: 392570 windows identical, ckpt dir removed
+  round 8 sk-r8-3: succeeded, attempts 3, PASS: 392570 windows identical, ckpt dir removed
+  round 8: 6 node kill(s), 236 s, load 2.77 5.86 5.51
+  round 9 sk-r9-1: succeeded, attempts 4, PASS: 392570 windows identical, ckpt dir removed
+  round 9 sk-r9-2: succeeded, attempts 6, PASS: 392570 windows identical, ckpt dir removed
+  round 9 sk-r9-3: succeeded, attempts 3, PASS: 392570 windows identical, ckpt dir removed
+  round 9: 5 node kill(s), 523 s, load 2.90 5.60 5.43
+  round 10 sk-r10-1: succeeded, attempts 1, PASS: 392570 windows identical, ckpt dir removed
+  round 10 sk-r10-2: succeeded, attempts 1, PASS: 392570 windows identical, ckpt dir removed
+  round 10 sk-r10-3: succeeded, attempts 20, PASS: 392570 windows identical, ckpt dir removed
+  round 10: 18 node kill(s), 361 s, load 2.28 4.67 5.09
+
+== summary over 10 rounds (2218 s)
+  node kills: 76
+  attempts started: 120 (35 fresh, 85 resumed from a MANIFEST, 0 resumed over uncommitted leftovers)
+  failovers (attempts after the first: node kills, plus mass deaths after a machine pause): 90
+  streamkit runs that completed: 34 for 30 jobs (27 of them resumed from a checkpoint; 4 completed but lost with their node before the exit was reported)
+  starts refused or attempts stopped by the attempt fence: 0 (expected 0)
+  nodes declared dead: 56, longest silence before it: 493325 ms (3,000 ms expected)
+  machine pauses over 500 ms seen by the stall probe: 10, 1778.3 s in total
+  kill -> replacement started (all samples no pause overlapped): n=88 min 1028 ms, median 2465 ms, max 6261 ms
+  kill -> replacement started (back (re-registered) before declared dead): n=58 min 1028 ms, median 2052 ms, max 6261 ms
+  kill -> replacement started (declared dead first): n=30 min 2574 ms, median 3067 ms, max 3496 ms
+  kill -> replacement started (overlapped by a machine pause, excluded above): n=3 min 89256 ms, median 283429 ms, max 497611 ms
+  (kill, task) pairs where the task finished just before the kill (no replacement needed): 1
+  attempt intervals checked from the event logs: 120 attempts, 0 overlapping or unaccounted
+  jobs that did not PASS: 0 of 30
+  load at end: 2.28 4.67 5.09
+RESULT: PASS (30 jobs identical to the oracle across 76 node kills)
+
+== teardown
+no task processes left behind

@@ -41,6 +41,14 @@
 // a few hundred ms instead of a full interval or more. It needs no new
 // registration: its epoch is in the replicated state, so the new leader
 // accepts its next heartbeat as is.
+//
+// STATEFUL TASKS (m5). A launch with a checkpoint directory goes through
+// agent/stateful.h before the runtime sees it: the attempt fence is taken
+// (a start older than one already recorded is refused as superseded), and
+// the command line is chosen by what the directory holds: argv for a first
+// start, resume_argv when an earlier attempt left a checkpoint. While such
+// an attempt runs, every heartbeat re-reads its fence and stops it if a
+// newer attempt has started anywhere (check_fences).
 
 #include <chrono>
 #include <compare>
@@ -114,6 +122,8 @@ class Agent {
     uint64_t heartbeats_failed = 0;
     uint64_t started = 0;
     uint64_t fenced = 0;  // times the master refused our epoch
+    uint64_t resumed = 0;     // stateful starts that ran the resume command (m5)
+    uint64_t superseded = 0;  // stateful starts refused, or attempts stopped, by the fence
   };
   Stats stats() const;  // thread-safe
 
@@ -135,6 +145,10 @@ class Agent {
     int signal = 0;
     bool oom_killed = false;
     std::string message;
+    // Stateful (m5): empty for a stateless task. superseded: the fence
+    // showed a newer attempt and the stop has been sent (logged once).
+    std::string checkpoint_dir;
+    bool superseded = false;
   };
 
   bool stop_requested() const;
@@ -144,6 +158,13 @@ class Agent {
   void do_heartbeat();
   void collect_exits();
   void launch(const v1::TaskLaunch& l);
+  // Stateful launch (m5): takes the fence and picks argv or resume_argv
+  // into *argv, with a note for the start log line in *note. False with
+  // *why set when the attempt must not start.
+  bool prepare_stateful(const v1::TaskLaunch& l, const Key& key, std::vector<std::string>* argv,
+                        std::string* note, std::string* why);
+  // Stops every running stateful attempt whose fence shows a newer one.
+  void check_fences();
   void publish_stats();
   void log(const std::string& line) const;
   // Appends one line to options_.event_log (if set), stamped `when`.
@@ -176,6 +197,7 @@ class Agent {
   std::map<Key, Instance> instances_;
   std::map<RuntimeHandle, Key> by_handle_;
   uint64_t hb_ok_ = 0, hb_failed_ = 0, started_ = 0, fenced_ = 0;
+  uint64_t resumed_ = 0, superseded_ = 0;
 
   // Shared with other threads.
   mutable std::mutex mu_;

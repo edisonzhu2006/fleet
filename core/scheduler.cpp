@@ -183,12 +183,13 @@ std::optional<PreemptionPlan> Scheduler::plan_preemption(
     }
     // Only strictly lower priority is ever a candidate: equal priority
     // would let two tasks evict each other forever, and higher priority
-    // would invert the whole point of priorities.
+    // would invert the whole point of priorities. A task marked not
+    // preemptible (a stateful one, m5) is never a candidate at all.
     std::vector<Candidate> cands;
     Resources evictable;
     for (TaskId id : state.tasks_on(n.id)) {
       const Task& v = state.task(id);
-      if (v.priority < task.priority) {
+      if (v.priority < task.priority && v.preemptible) {
         cands.push_back({v.id, v.request, v.priority});
         evictable += v.request;
       }

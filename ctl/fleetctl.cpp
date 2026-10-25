@@ -3,7 +3,8 @@
 //   fleetctl [--master HOST:PORT[,HOST:PORT...]] [--timeout-ms N] <command> ...
 //     submit --job J --cpu MILLICPU --mem MB [--priority 0..3] [--count N]
 //            [--label k=v]... [--image IMAGE]
-//            [--restart never|on-failure|always] -- COMMAND [ARGS...]
+//            [--restart never|on-failure|always]
+//            [--checkpoint-dir DIR [--resume-arg ARG]...] -- COMMAND [ARGS...]
 //     list [--job J]
 //     kill --task ID | --job J
 //     drain NODE
@@ -55,7 +56,10 @@ using fleet::v1::Master;
                "usage: fleetctl [--master HOST:PORT[,HOST:PORT...]] [--timeout-ms N] <command>\n"
                "  submit --job J --cpu MILLICPU --mem MB [--priority 0..3] [--count N]\n"
                "         [--label k=v]... [--image IMAGE]\n"
-               "         [--restart never|on-failure|always] -- COMMAND [ARGS...]\n"
+               "         [--restart never|on-failure|always]\n"
+               "         [--checkpoint-dir DIR [--resume-arg ARG]...] -- COMMAND [ARGS...]\n"
+               "         (stateful, m5: the resume command is COMMAND ARGS... followed by\n"
+               "          every --resume-arg, e.g. --resume-arg --resume for streamkit)\n"
                "  list [--job J]\n"
                "  kill --task ID | --job J\n"
                "  drain NODE\n"
@@ -230,6 +234,10 @@ void print_list(const fleet::v1::ListResponse& r) {
     }
     // The image, when one was given, prefixes the command: "[alpine:3.20] sh -c ...".
     std::string cmd = t.image().empty() ? "" : "[" + t.image() + "]";
+    // A stateful task (m5) shows its checkpoint dir the same way.
+    if (!t.checkpoint_dir().empty()) {
+      cmd += (cmd.empty() ? "" : " ") + ("{ckpt " + t.checkpoint_dir() + "}");
+    }
     for (const auto& a : t.argv()) cmd += (cmd.empty() ? "" : " ") + a;
     // A task in backoff shows how long until it is pending again.
     std::string state = task_state(t.state());
@@ -270,6 +278,11 @@ int main(int argc, char** argv) {
   if (cmd == "submit") {
     fleet::v1::SubmitRequest req;
     req.set_priority(1);
+    // The resume command (m5) is the command plus these, so the common
+    // case (one extra flag) needs no second copy of a long command line.
+    // The proto carries the full resume argv, so other clients can send a
+    // different command altogether.
+    std::vector<std::string> resume_args;
     for (; i < argc; ++i) {
       const std::string a = argv[i];
       if (a == "--") {
@@ -300,6 +313,10 @@ int main(int argc, char** argv) {
         } else {
           usage();
         }
+      } else if (a == "--checkpoint-dir") {
+        req.set_checkpoint_dir(v);
+      } else if (a == "--resume-arg") {
+        resume_args.push_back(v);
       } else if (a == "--label") {
         const size_t eq = v.find('=');
         if (eq == std::string::npos) usage();
@@ -310,6 +327,10 @@ int main(int argc, char** argv) {
     }
     for (; i < argc; ++i) req.add_argv(argv[i]);
     if (req.argv().empty()) usage();
+    if (!resume_args.empty()) {
+      *req.mutable_resume_argv() = req.argv();
+      for (const std::string& a : resume_args) req.add_resume_argv(a);
+    }
     // 128 random bits: an id no other submission will ever use, the same
     // across every retry of this one.
     std::random_device rd;
