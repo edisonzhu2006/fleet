@@ -72,6 +72,10 @@ message TasksSubmitted {
   repeated string argv = 7;
   string image = 8;
   RestartPolicy restart_policy = 9;
+  // SubmitRequest.request_id (m4b), so every replica, and a master after
+  // a restart, knows the submission was admitted: a retry is answered
+  // with these task ids instead of being admitted again.
+  string request_id = 10;
 }
 
 // The scheduler placed a pending task. `attempt` is the attempt this
@@ -208,9 +212,18 @@ message SnapshotTask {
   string message = 22;
 }
 
+// A submission that carried a request id (m4b): its tasks are
+// first_task_id .. first_task_id + count - 1.
+message SnapshotSubmission {
+  string request_id = 1;
+  uint32 first_task_id = 2;
+  uint32 count = 3;
+}
+
 message Snapshot {
   uint64 lsn = 1;  // the last record this snapshot includes
   uint64 next_epoch = 2;
   repeated SnapshotNode nodes = 3;  // index = node id
   repeated SnapshotTask tasks = 4;  // index = task id
+  repeated SnapshotSubmission submissions = 5;  // in request id order
 }

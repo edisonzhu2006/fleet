@@ -22,7 +22,7 @@ namespace {
 
 void usage() {
   std::fprintf(stderr,
-               "usage: fleetlet --name NAME --cpu MILLICPU --mem MB [--master HOST:PORT]\n"
+               "usage: fleetlet --name NAME --cpu MILLICPU --mem MB [--master HOST:PORT[,HOST:PORT...]]\n"
                "                [--label k=v]... [--work-dir DIR] [--stop-grace-ms N]\n"
                "                [--runtime process|docker] [--docker-image IMAGE]\n"
                "                [--docker CLI] [--docker-poll-ms N] [--event-log FILE] [--quiet]\n"

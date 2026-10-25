@@ -67,33 +67,24 @@
 #include <string_view>
 #include <vector>
 
+#include "durable_io.h"
 #include "master_state.h"
 #include "wal.pb.h"
 
 namespace fleet {
 
-// CRC-32C (Castagnoli polynomial, reflected 0x82F63B78), table-driven.
-// `crc` continues a previous call: crc32c(b, crc32c(a)) == crc32c(a ++ b).
-uint32_t crc32c(const void* data, size_t n, uint32_t crc = 0);
+// CRC-32C, SyncMode, sync_fd and append_frame live in common/durable_io.h
+// since m4b (the Raft log shares them); this header re-exports them through
+// that include, so m4 callers are unchanged.
 
-// How a batch is made durable.
-enum class SyncMode : uint8_t {
-  kFull,   // F_FULLFSYNC on Apple, fdatasync elsewhere: survives power loss
-  kFsync,  // plain fsync: on macOS does not flush the drive cache
-  kNone,   // page cache only: survives a process crash, not a power cut
-};
 enum class SyncPolicy : uint8_t {
   kGroup,      // one sync per append() batch (the default)
   kPerRecord,  // one sync per record (for comparison)
 };
 
-// Makes everything written to fd durable, per mode. Returns false with
-// errno set on failure.
-bool sync_fd(int fd, SyncMode mode);
-
-// Frames and parses (exposed for tests and the benchmark).
-void append_frame(std::string* out, const std::string& payload);
-
+// Parses a log file's frames into records (exposed for tests and the
+// benchmark). The torn-tail rule is split_frames'; on top of it, a frame
+// whose checksum matches but whose payload is not a WalRecord is an error.
 struct ParsedLog {
   std::vector<v1::WalRecord> records;
   size_t valid_bytes = 0;  // prefix made of complete, valid frames

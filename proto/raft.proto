@@ -1,0 +1,144 @@
+// raft.proto: the messages Raft replicas exchange, and Raft's on-disk
+// formats (m4b).
+//
+// WHY THIS EXISTS. From m4b the master runs as 3 replicas that agree on
+// every state change with Raft (Ongaro and Ousterhout, "In Search of an
+// Understandable Consensus Algorithm", 2014). The RPCs below are the
+// paper's Figure 2 (RequestVote, AppendEntries) and Figure 13
+// (InstallSnapshot), field for field, plus three additions, each marked
+// EXTRA and explained where it appears. Raft treats a command as opaque
+// bytes; in fleet each command is one serialized fleet.v1.WalRecord, the
+// same decision records the m4 write-ahead log held, so "the WAL" simply
+// became "the Raft log".
+//
+// SEPARATE FROM fleet.proto because it is a different contract: replica to
+// replica, versus agent/CLI to master. Same field-number rules (never
+// renumber, never reuse), since replicas of different versions talk during
+// a rolling upgrade.
+//
+// Server ids are 1..N; 0 means "none" (no vote cast, leader unknown).
+
+syntax = "proto3";
+
+package fleet.raft.v1;
+
+// One log entry. `index` is redundant on the wire (entries in an
+// AppendEntries are consecutive from prev_log_index + 1) but makes every
+// entry self-describing in the log file, where recovery checks it.
+message Entry {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    // The blank entry a new leader appends at the start of its term
+    // (Raft paper section 8; dissertation 6.4). Committing it commits
+    // everything before it, which a leader cannot do by counting replicas
+    // for entries of earlier terms (Figure 8). fleet's leader does not
+    // schedule until its no-op is committed and applied.
+    TYPE_NOOP = 1;
+    TYPE_COMMAND = 2;  // `command` is a serialized fleet.v1.WalRecord
+  }
+  uint64 term = 1;
+  uint64 index = 2;
+  Type type = 3;
+  bytes command = 4;
+}
+
+// ------------------------------------------------------------ RequestVote
+
+message RequestVoteRequest {
+  uint64 term = 1;            // candidate's term
+  uint32 candidate_id = 2;
+  uint64 last_log_index = 3;  // index of candidate's last log entry
+  uint64 last_log_term = 4;   // term of candidate's last log entry
+}
+
+message RequestVoteResponse {
+  uint64 term = 1;  // currentTerm, for the candidate to update itself
+  bool vote_granted = 2;
+}
+
+// ---------------------------------------------------------- AppendEntries
+
+message AppendEntriesRequest {
+  uint64 term = 1;  // leader's term
+  uint32 leader_id = 2;  // so followers can redirect clients
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated Entry entries = 5;  // empty for a heartbeat
+  uint64 leader_commit = 6;
+  // EXTRA (ReadIndex, dissertation 6.4): the leader's read round when this
+  // was sent, echoed in the response. A reply counts as "this follower
+  // still accepted me as leader after the read arrived" only if it echoes
+  // a round at least the read's. Not part of Figure 2's safety argument;
+  // it only gates when a leader may answer a client.
+  uint64 round = 7;
+}
+
+message AppendEntriesResponse {
+  uint64 term = 1;  // currentTerm, for the leader to update itself
+  // True if the follower contained an entry matching prev_log_index and
+  // prev_log_term (and has now appended the entries).
+  bool success = 2;
+  // EXTRA: the request's term, echoed. A response to a request from an
+  // earlier term of the same leader (delayed in the network) must be
+  // dropped; resp.term alone cannot tell, because a follower that has
+  // since moved to the leader's current term answers with that term.
+  uint64 request_term = 3;
+  // EXTRA, on success: the follower's log matches the leader's through
+  // this index (prev_log_index + entries). Lets the leader set matchIndex
+  // from the response itself, so reordered or duplicated responses are
+  // harmless (matchIndex only goes up).
+  uint64 match_index = 4;
+  // EXTRA, on failure (the paper's suggested optimization at the end of
+  // section 5.3): the first index the leader should try next. The
+  // follower's last index + 1 if its log is too short, else the first
+  // index it holds of the conflicting term, so one round trip skips a
+  // whole term of conflicting entries instead of one entry.
+  uint64 conflict_index = 5;
+  uint64 round = 6;  // echo of the request's round
+}
+
+// -------------------------------------------------------- InstallSnapshot
+
+// Figure 13, sent whole rather than in offset/done chunks: fleet's
+// snapshots are a few MB at most (NOTES.md m4: 2 MB for 50,000 tasks), and
+// the replicas raise gRPC's message limit to 64 MB. Chunking is what a
+// larger state would need.
+message InstallSnapshotRequest {
+  uint64 term = 1;
+  uint32 leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  bytes data = 5;  // a serialized fleet.v1.Snapshot (the m4 snapshot format)
+  uint64 round = 6;  // EXTRA: as in AppendEntriesRequest
+}
+
+message InstallSnapshotResponse {
+  uint64 term = 1;
+  uint64 request_term = 2;         // EXTRA: as in AppendEntriesResponse
+  uint64 last_included_index = 3;  // EXTRA: echo, becomes matchIndex
+  uint64 round = 4;                // EXTRA: echo
+}
+
+service Raft {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+// ------------------------------------------------------------ storage
+
+// Figure 2's persistent state other than the log: written to its own
+// file, atomically (temp file, sync, rename, sync the directory), before
+// any message that depends on it is sent.
+message HardState {
+  uint64 current_term = 1;
+  uint32 voted_for = 2;  // 0: none in current_term
+}
+
+// A compacted prefix of the log: the state machine after applying entries
+// 1..last_included_index.
+message SnapshotFile {
+  uint64 last_included_index = 1;
+  uint64 last_included_term = 2;
+  bytes data = 3;  // a serialized fleet.v1.Snapshot
+}

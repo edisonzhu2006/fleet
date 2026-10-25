@@ -3,8 +3,10 @@
 
 #include "agent.h"
 
+#include "leader_redirect.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <grpcpp/create_channel.h>
 #include <grpcpp/security/credentials.h>
@@ -21,14 +23,61 @@ std::chrono::system_clock::time_point deadline_after(std::chrono::milliseconds d
 
 Agent::Agent(AgentOptions options, std::unique_ptr<Runtime> runtime)
     : options_(std::move(options)), runtime_(std::move(runtime)) {
-  grpc::ChannelArguments args;
-  // gRPC backs off reconnects exponentially up to 120 s by default; after
-  // a master restart that could leave an agent silent for minutes. Cap it
-  // near the heartbeat interval so the agent is back within a beat or two.
-  args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 1000);
-  args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 100);
-  stub_ = v1::Master::NewStub(grpc::CreateCustomChannel(
-      options_.master_address, grpc::InsecureChannelCredentials(), args));
+  masters_ = split_addresses(options_.master_address);
+  if (masters_.empty()) masters_.push_back(options_.master_address);
+}
+
+v1::Master::Stub& Agent::stub_for(const std::string& address) {
+  auto& stub = stubs_[address];
+  if (!stub) {
+    grpc::ChannelArguments args;
+    // gRPC backs off reconnects exponentially up to 120 s by default; after
+    // a master restart that could leave an agent silent for minutes. Cap it
+    // near the heartbeat interval so the agent is back within a beat or two.
+    args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 1000);
+    args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 100);
+    stub = v1::Master::NewStub(
+        grpc::CreateCustomChannel(address, grpc::InsecureChannelCredentials(), args));
+  }
+  return *stub;
+}
+
+template <typename F>
+grpc::Status Agent::call_master(F&& f) {
+  grpc::Status s;
+  // A follower's hint, then the leader: at most two redirects per call,
+  // so a hint loop between confused replicas cannot spin the agent.
+  for (int hop = 0; hop < 3; ++hop) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(deadline_after(options_.rpc_deadline));
+    const std::string& address = masters_[current_];
+    s = f(stub_for(address), &ctx);
+    if (!should_retry_elsewhere(s)) {
+      retry_delay_ = std::chrono::milliseconds(0);
+      return s;
+    }
+    const std::string hint = leader_hint(ctx);
+    if (!hint.empty() && hint != address) {
+      // Redirected. The replicas name the leader by the address in their
+      // --peers list, which may not be spelled as in ours; then it is added.
+      auto it = std::find(masters_.begin(), masters_.end(), hint);
+      if (it == masters_.end()) it = masters_.insert(masters_.end(), hint);
+      current_ = static_cast<size_t>(it - masters_.begin());
+      log("redirected to the leader at " + hint);
+      continue;
+    }
+    // Not redirected elsewhere: this replica is down, knows no leader, or
+    // is the leader but cannot serve (its no-op is not committed yet, or
+    // it is cut off from the majority and cannot confirm it still leads:
+    // then it names itself). In every case the next replica is the better
+    // bet; if this one was right after all, the next redirects back.
+    current_ = (current_ + 1) % masters_.size();
+    break;
+  }
+  retry_delay_ = retry_delay_.count() == 0
+                     ? std::chrono::milliseconds(50)
+                     : std::min(retry_delay_ * 2, options_.heartbeat_interval);
+  return s;
 }
 
 Agent::~Agent() {
@@ -159,11 +208,12 @@ void Agent::run() {
       }
       // Scheduled from when this beat started, not from when the call
       // returned, so a slow call does not stretch the cadence. A heartbeat
-      // that was refused as unknown/stale re-registers at once; a failed
-      // registration (master down) waits a full interval before retrying.
-      next_beat = (was_registered && !registered_)
-                      ? now
-                      : now + options_.heartbeat_interval;
+      // that was refused as unknown/stale re-registers at once; a call no
+      // master answered (down, or not the leader) is retried after the
+      // redirect backoff (m4b), which is at most one interval.
+      next_beat = (was_registered && !registered_) ? now
+                  : retry_delay_.count() > 0       ? now + retry_delay_
+                                                   : now + options_.heartbeat_interval;
     }
     publish_stats();
     // Interruptible sleep: request_stop() wakes us immediately.
@@ -189,9 +239,9 @@ void Agent::do_register() {
   req.mutable_capacity()->set_memory_mb(options_.capacity.memory_mb);
   req.mutable_labels()->insert(options_.labels.begin(), options_.labels.end());
   v1::RegisterNodeResponse resp;
-  grpc::ClientContext ctx;
-  ctx.set_deadline(deadline_after(options_.rpc_deadline));
-  grpc::Status s = stub_->RegisterNode(&ctx, req, &resp);
+  grpc::Status s = call_master([&](v1::Master::Stub& stub, grpc::ClientContext* ctx) {
+    return stub.RegisterNode(ctx, req, &resp);
+  });
   if (!s.ok()) {
     ++hb_failed_;
     log("register failed: " + s.error_message());
@@ -247,9 +297,9 @@ void Agent::do_heartbeat() {
     st->set_message(inst.message);
   }
   v1::HeartbeatResponse resp;
-  grpc::ClientContext ctx;
-  ctx.set_deadline(deadline_after(options_.rpc_deadline));
-  grpc::Status s = stub_->Heartbeat(&ctx, req, &resp);
+  grpc::Status s = call_master([&](v1::Master::Stub& stub, grpc::ClientContext* ctx) {
+    return stub.Heartbeat(ctx, req, &resp);
+  });
   if (!s.ok()) {
     ++hb_failed_;
     if (s.error_code() == grpc::StatusCode::FAILED_PRECONDITION) {

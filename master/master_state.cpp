@@ -16,6 +16,13 @@ std::optional<NodeId> MasterState::find_node(const std::string& name) const {
   return it->second;
 }
 
+std::optional<MasterState::Submission> MasterState::find_submission(
+    const std::string& request_id) const {
+  auto it = submissions_.find(request_id);
+  if (it == submissions_.end()) return std::nullopt;
+  return it->second;
+}
+
 std::string MasterState::apply(const v1::WalRecord& r) {
   // The LSN check is what turns "the snapshot and the log do not belong
   // together" or "a record was lost in the middle" into an error instead
@@ -125,6 +132,11 @@ std::string MasterState::apply_tasks_submitted(const v1::TasksSubmitted& r) {
   if (r.count() == 0) return "empty submission";
   const auto policy = from_proto(r.restart_policy());
   if (!policy) return "unknown restart policy";
+  // MasterCore answers a repeated request id from the state instead of
+  // logging it again, so a second one in the log is a bug.
+  if (!r.request_id().empty() && submissions_.count(r.request_id())) {
+    return "request id " + r.request_id() + " was already admitted";
+  }
   const TaskSpec spec{r.job(), r.priority(), from_proto(r.request()),
                       from_proto(r.required_labels())};
   for (uint32_t i = 0; i < r.count(); ++i) {
@@ -137,6 +149,9 @@ std::string MasterState::apply_tasks_submitted(const v1::TasksSubmitted& r) {
     m.image = r.image();
     m.policy = *policy;
     tasks_.push_back(std::move(m));
+  }
+  if (!r.request_id().empty()) {
+    submissions_.emplace(r.request_id(), Submission{r.first_task_id(), r.count()});
   }
   return {};
 }
@@ -282,6 +297,12 @@ void MasterState::to_snapshot(v1::Snapshot* out) const {
     st->set_oom_killed(m.oom_killed);
     st->set_message(m.message);
   }
+  for (const auto& [id, sub] : submissions_) {  // std::map: in id order
+    v1::SnapshotSubmission* ss = out->add_submissions();
+    ss->set_request_id(id);
+    ss->set_first_task_id(sub.first_task_id);
+    ss->set_count(sub.count);
+  }
 }
 
 std::optional<MasterState> MasterState::from_snapshot(const v1::Snapshot& snap,
@@ -341,6 +362,14 @@ std::optional<MasterState> MasterState::from_snapshot(const v1::Snapshot& snap,
     m.message = st.message();
     if (t.state == TaskState::kBackoff) s.backoff_.insert({m.restart_at_ms, t.id});
     s.tasks_.push_back(std::move(m));
+  }
+  for (const v1::SnapshotSubmission& ss : snap.submissions()) {
+    if (ss.request_id().empty() || ss.count() == 0 ||
+        uint64_t{ss.first_task_id()} + ss.count() > s.tasks_.size() ||
+        !s.submissions_.emplace(ss.request_id(), Submission{ss.first_task_id(), ss.count()})
+             .second) {
+      return fail("bad submission record for request id '" + ss.request_id() + "'");
+    }
   }
   // Everything derived was rebuilt above; prove it is consistent before
   // anyone acts on it.

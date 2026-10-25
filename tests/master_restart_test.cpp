@@ -215,13 +215,17 @@ TEST_F(MasterRestartTest, ExitsDuringTheOutageAreAppliedOnceAfterIt) {
   add_agent("a");
   // Tasks that finish while the master is down: their agents keep the
   // exits (unacknowledged) and report them to the restarted master.
-  const auto ids = submit("brief", {"/bin/sh", "-c", "sleep 0.5"}, 2);
+  // 1 s tasks and a 1.4 s outage (m4b: were 0.5 s and 0.9 s): the agent
+  // forks the two one after the other, and under TSan on a loaded machine
+  // a fork can take a few hundred ms, which left 0.5 s tasks too short an
+  // overlap for the wait below to see both running.
+  const auto ids = submit("brief", {"/bin/sh", "-c", "sleep 1"}, 2);
   ASSERT_TRUE(wait_for([&] { return all_in(ids, v1::TASK_STATE_RUNNING); }));
   ASSERT_TRUE(wait_for([&] { return agents_[0]->stats().running == 2; }));
   const int port = master_->port();
   master_->shutdown();
   master_.reset();
-  std::this_thread::sleep_for(900ms);  // both exit meanwhile
+  std::this_thread::sleep_for(1400ms);  // both exit meanwhile
   start_master(port);
   ASSERT_TRUE(wait_for([&] { return all_in(ids, v1::TASK_STATE_SUCCEEDED); }));
   const auto t = tasks();

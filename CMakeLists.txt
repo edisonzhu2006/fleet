@@ -77,11 +77,12 @@ if(FLEET_BUILD_TESTS)
 endif()
 
 # Each component owns its CMakeLists.txt. Libraries: fleet_core (model +
-# scheduler, pure), fleet_proto (gRPC/Protobuf stubs), fleet_master_lib
-# (master logic + gRPC server), fleet_agent_lib (agent + runtimes).
-# Executables: fleetmaster, fleetlet, fleetctl, fleetsim. Tests:
+# scheduler, pure), fleet_proto (gRPC/Protobuf stubs), fleet_io (frames and
+# fsync, m4b), fleet_raft (Raft consensus, m4b), fleet_master_lib (master
+# logic + gRPC servers, single and replicated), fleet_agent_lib (agent +
+# runtimes). Executables: fleetmaster, fleetlet, fleetctl, fleetsim. Tests:
 # tests/*.cpp -> fleet_tests.
-foreach(dir common core proto master agent ctl sim)
+foreach(dir common core proto raft master agent ctl sim)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${dir}/CMakeLists.txt)
     add_subdirectory(${dir})
   endif()
@@ -92,7 +93,7 @@ if(FLEET_BUILD_TESTS)
   if(FLEET_TEST_SOURCES)
     add_executable(fleet_tests ${FLEET_TEST_SOURCES})
     target_link_libraries(fleet_tests PRIVATE fleet_flags GTest::gtest_main Threads::Threads)
-    foreach(lib fleet_core fleet_proto fleet_master_lib fleet_agent_lib)
+    foreach(lib fleet_core fleet_proto fleet_io fleet_raft fleet_master_lib fleet_agent_lib)
       if(TARGET ${lib})
         target_link_libraries(fleet_tests PRIVATE ${lib})
       endif()

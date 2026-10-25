@@ -1,0 +1,242 @@
+### run 1: bench/leader_failover.sh
+== machine: Apple M5 Pro, load: 4.01 5.10 4.69
+== replication cost per call (replicabench, in-process, loopback gRPC)
+  replicabench: 200 sequential calls of each kind, sync full (F_FULLFSYNC)
+  A. m4 single master, one local log sync per write
+    Submit (1 record)                            p50   3.768 ms   p99   5.285 ms   max   5.812 ms   (n=200)
+    List                                         p50   0.195 ms   p99   0.355 ms   max   0.362 ms   (n=200)
+  B. leader of 3 Raft replicas: commit on a majority + read round
+    Submit (1 record)                            p50   8.736 ms   p99  13.254 ms   max  14.685 ms   (n=200)
+    List                                         p50   0.326 ms   p99   0.778 ms   max   1.068 ms   (n=200)
+    replica 1: 193 log syncs, mean 3.209 ms each
+    replica 2: 211 log syncs, mean 3.095 ms each
+    replica 3: 211 log syncs, mean 3.200 ms each
+
+  ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+  127.0.0.1:17501          1 leader         1      1        4        4        4        0        3 serving
+  127.0.0.1:17502          2 follower       1      1        4        4        4        0        3 
+  127.0.0.1:17503          3 follower       1      1        4        4        4        0        3 
+  submitted job svc: 0 1 2 3
+
+== 20 leader SIGKILL trials (the killed replica restarted at once each time)
+  trial killed  new      kill->elect  kill->serve   kill->sched   catch-up elections
+  1     r1/t1   r3/t2         186 ms       190 ms        232 ms      65 ms         1
+  2     r3/t2   r2/t3         266 ms       272 ms        299 ms      63 ms         1
+  3     r2/t3   r1/t4         171 ms       174 ms        254 ms      64 ms         1
+  4     r1/t4   r2/t5         200 ms       203 ms        419 ms      65 ms         1
+  5     r2/t5   r1/t6         262 ms       266 ms        310 ms      68 ms         1
+  6     r1/t6   r3/t7         135 ms       138 ms        307 ms      64 ms         1
+  7     r3/t7   r1/t8         242 ms       250 ms        409 ms      67 ms         1
+  8     r1/t8   r3/t9         263 ms       266 ms        500 ms      65 ms         1
+  9     r3/t9   r1/t10        222 ms       228 ms        299 ms      70 ms         1
+  10    r1/t10  r3/t11        217 ms       220 ms        395 ms      78 ms         1
+  11    r3/t11  r2/t12        226 ms       229 ms        342 ms      62 ms         1
+  12    r2/t12  r3/t13        204 ms       211 ms        276 ms      61 ms         1
+  13    r3/t13  r3/t14        229 ms       235 ms        412 ms      13 ms         1
+  14    r3/t14  r1/t15        216 ms       224 ms        286 ms      60 ms         1
+  15    r1/t15  r2/t16        167 ms       173 ms        310 ms      59 ms         1
+  16    r2/t16  r3/t17        197 ms       203 ms        505 ms      65 ms         1
+  17    r3/t17  r2/t18        184 ms       187 ms        242 ms      62 ms         1
+  18    r2/t18  r1/t19        185 ms       192 ms        352 ms      62 ms         1
+  19    r1/t19  r3/t20        155 ms       163 ms        251 ms      64 ms         1
+  20    r3/t20  r2/t21        233 ms       239 ms        399 ms      65 ms         1
+
+== partition test: cut the leader off from the other two replicas
+  leader is replica 2 (term 21); before:
+    ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+    127.0.0.1:17501          1 follower      21      2      771      771      771      603      750 
+    127.0.0.1:17502          2 leader        21      2      771      771      771      603      750 serving
+    127.0.0.1:17503          3 follower      21      2      771      771      771      603      750 
+  submission sent to the isolated leader: not acknowledged after 2089 ms: fleetctl: deadline exceeded: Deadline Exceeded
+  the other two elected replica 1 leader of term 22 246 ms after the isolation, serving 249 ms after it
+  majority side: submitted job majority: 280
+  while isolated (replica 2 still thinks it leads term 21, but cannot commit):
+    ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+    127.0.0.1:17501          1 leader        22      1      810      810      810      803      788 serving
+    127.0.0.1:17502          2 leader        21      2      771      771      776      603      750 serving, ISOLATED
+    127.0.0.1:17503          3 follower      22      1      810      810      810      803      788 
+  isolated replica: commit index 771 -> 771, last index 776 (its uncommitted entries)
+  healed: replica 2 stepped down 14 ms after the isolation was lifted (its log), and had caught up (applied >= the leader's commit when polled) 663 ms after:
+    ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+    127.0.0.1:17501          1 leader        22      1      819      819      819      803      797 serving
+    127.0.0.1:17502          2 follower      22      1      819      819      819      803      797 
+    127.0.0.1:17503          3 follower      22      1      819      819      819      803      797 
+  tasks of the submission the isolated leader took: 0 (its entries were overwritten); of the majority's: 1
+  log: 21:04:10.557 fleetmaster[2]: no longer serving (leader of term 21); discarded the state not yet committed
+
+== stopping the client; waiting for every acknowledged task to finish
+
+== summary over 20 leader SIGKILLs and one partition
+  kill -> new leader elected             min   135  median   210  max   266 ms
+  kill -> new leader serving             min   138  median   215  max   272 ms
+  kill -> scheduling (agents reported)   min   232  median   310  max   505 ms
+  restart -> killed replica caught up    min    13  median    64  max    78 ms
+  leaderships over the run: 22, terms with two leaders: 0
+  log compactions: 10, snapshot restores (startup or InstallSnapshot): 17
+  batch tasks acknowledged to the client: 284 (refused: 0 submissions, outcome unknown: 0)
+  batch tasks the master has: 284 (any above 284 were committed after the client gave up)
+  batch jobs admitted twice: 0
+  lost (acknowledged but not succeeded): 0
+  services still running at attempt 1: 4 of 4
+  placed but never started before a leader died (requeued at the node's first report): 42
+  tasks with event-log instances: 289, instances: 289, tasks started more than once: 0
+  overlapping instances of one task: 0
+  agents fenced: 0, nodes re-registered: 0
+  PASS: no committed task lost, none ran twice concurrently, one leader per term
+
+== teardown
+no task processes left behind
+exit=0
+
+### run 2: bench/leader_failover.sh
+== machine: Apple M5 Pro, load: 4.02 4.91 4.65
+== replication cost per call (replicabench, in-process, loopback gRPC)
+  replicabench: 200 sequential calls of each kind, sync full (F_FULLFSYNC)
+  A. m4 single master, one local log sync per write
+    Submit (1 record)                            p50   3.689 ms   p99   5.061 ms   max   5.161 ms   (n=200)
+    List                                         p50   0.178 ms   p99   0.323 ms   max   0.346 ms   (n=200)
+  B. leader of 3 Raft replicas: commit on a majority + read round
+    Submit (1 record)                            p50   9.637 ms   p99  12.858 ms   max  14.281 ms   (n=200)
+    List                                         p50   0.339 ms   p99   0.563 ms   max   0.589 ms   (n=200)
+    replica 1: 211 log syncs, mean 3.476 ms each
+    replica 2: 211 log syncs, mean 3.403 ms each
+    replica 3: 194 log syncs, mean 3.510 ms each
+
+  ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+  127.0.0.1:17501          1 follower       1      2        4        4        4        0        3 
+  127.0.0.1:17502          2 leader         1      2        4        4        4        0        3 serving
+  127.0.0.1:17503          3 follower       1      2        4        4        4        0        3 
+  submitted job svc: 0 1 2 3
+
+== 20 leader SIGKILL trials (the killed replica restarted at once each time)
+  trial killed  new      kill->elect  kill->serve   kill->sched   catch-up elections
+  1     r2/t1   r3/t2         300 ms       309 ms        385 ms      76 ms         1
+  2     r3/t2   r1/t3         166 ms       172 ms        199 ms      71 ms         1
+  3     r1/t3   r2/t4         245 ms       252 ms        421 ms      67 ms         1
+  4     r2/t4   r2/t5         238 ms       242 ms        437 ms      16 ms         1
+  5     r2/t5   r2/t6         219 ms       226 ms        434 ms      15 ms         1
+  6     r2/t6   r1/t7         172 ms       176 ms        210 ms      64 ms         1
+  7     r1/t7   r3/t8         247 ms       251 ms        288 ms      63 ms         1
+  8     r3/t8   r1/t9         195 ms       201 ms        383 ms      65 ms         1
+  9     r1/t9   r2/t10        182 ms       189 ms        369 ms      65 ms         1
+  10    r2/t10  r1/t11        187 ms       193 ms        268 ms      64 ms         1
+  11    r1/t11  r3/t12        227 ms       231 ms        299 ms      59 ms         1
+  12    r3/t12  r1/t13        174 ms       177 ms        276 ms      58 ms         1
+  13    r1/t13  r3/t14        164 ms       171 ms        399 ms     171 ms         1
+  14    r3/t14  r1/t15        175 ms       181 ms        422 ms      63 ms         1
+  15    r1/t15  r2/t16        154 ms       158 ms        330 ms      59 ms         1
+  16    r2/t16  r3/t17        288 ms       294 ms        352 ms      70 ms         1
+  17    r3/t17  r2/t18        228 ms       235 ms        483 ms      60 ms         1
+  18    r2/t18  r1/t19        210 ms       216 ms        447 ms      76 ms         1
+  19    r1/t19  r2/t20        261 ms       267 ms        455 ms      61 ms         1
+  20    r2/t20  r3/t21        167 ms       174 ms        364 ms      59 ms         1
+
+== partition test: cut the leader off from the other two replicas
+  leader is replica 3 (term 21); before:
+    ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+    127.0.0.1:17501          1 follower      21      3      789      789      789      609      768 
+    127.0.0.1:17502          2 follower      21      3      789      789      789      609      768 
+    127.0.0.1:17503          3 leader        21      3      789      789      789      609      768 serving
+  submission sent to the isolated leader: not acknowledged after 2089 ms: fleetctl: deadline exceeded: Deadline Exceeded
+  the other two elected replica 2 leader of term 22 176 ms after the isolation, serving 179 ms after it
+  majority side: submitted job majority: 288
+  while isolated (replica 3 still thinks it leads term 21, but cannot commit):
+    ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+    127.0.0.1:17501          1 follower      22      2      832      832      832      812      810 
+    127.0.0.1:17502          2 leader        22      2      832      832      832      812      810 serving
+    127.0.0.1:17503          3 leader        21      3      789      789      794      609      768 serving, ISOLATED
+  isolated replica: commit index 789 -> 789, last index 794 (its uncommitted entries)
+  healed: replica 3 stepped down 18 ms after the isolation was lifted (its log), and had caught up (applied >= the leader's commit when polled) 858 ms after:
+    ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+    127.0.0.1:17501          1 follower      22      2      850      850      850      812      828 
+    127.0.0.1:17502          2 leader        22      2      850      850      850      812      828 serving
+    127.0.0.1:17503          3 follower      22      2      850      850      850      812      828 
+  tasks of the submission the isolated leader took: 0 (its entries were overwritten); of the majority's: 1
+  log: 21:05:06.791 fleetmaster[3]: stepped down: saw term 22
+  log: 21:05:06.791 fleetmaster[3]: no longer serving (leader of term 21); discarded the state not yet committed
+
+== stopping the client; waiting for every acknowledged task to finish
+
+== summary over 20 leader SIGKILLs and one partition
+  kill -> new leader elected             min   154  median   202  max   300 ms
+  kill -> new leader serving             min   158  median   208  max   309 ms
+  kill -> scheduling (agents reported)   min   199  median   376  max   483 ms
+  restart -> killed replica caught up    min    15  median    63  max   171 ms
+  leaderships over the run: 22, terms with two leaders: 0
+  log compactions: 11, snapshot restores (startup or InstallSnapshot): 17
+  batch tasks acknowledged to the client: 294 (refused: 0 submissions, outcome unknown: 0)
+  batch tasks the master has: 294 (any above 294 were committed after the client gave up)
+  batch jobs admitted twice: 0
+  lost (acknowledged but not succeeded): 0
+  services still running at attempt 1: 4 of 4
+  placed but never started before a leader died (requeued at the node's first report): 44
+  tasks with event-log instances: 299, instances: 299, tasks started more than once: 0
+  overlapping instances of one task: 0
+  agents fenced: 0, nodes re-registered: 0
+  PASS: no committed task lost, none ran twice concurrently, one leader per term
+
+== teardown
+no task processes left behind
+exit=0
+### ASan: TRIALS=5 BIN=build-asan/bin PORT=17611 REPLICABENCH=0 bench/leader_failover.sh
+== machine: Apple M5 Pro, load: 2.55 4.00 4.32
+  ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+  127.0.0.1:17611          1 follower       1      3        4        4        4        0        3 
+  127.0.0.1:17612          2 follower       1      3        4        4        4        0        3 
+  127.0.0.1:17613          3 leader         1      3        4        4        4        0        3 serving
+  submitted job svc: 0 1 2 3
+
+== 5 leader SIGKILL trials (the killed replica restarted at once each time)
+  trial killed  new      kill->elect  kill->serve   kill->sched   catch-up elections
+  1     r3/t1   r2/t2         218 ms       224 ms        361 ms     179 ms         1
+  2     r2/t2   r1/t3         251 ms       257 ms        386 ms     174 ms         1
+  3     r1/t3   r3/t4         184 ms       187 ms        433 ms     179 ms         1
+  4     r3/t4   r1/t5         164 ms       171 ms        226 ms     173 ms         1
+  5     r1/t5   r2/t6         182 ms       188 ms        286 ms     173 ms         1
+
+== partition test: cut the leader off from the other two replicas
+  leader is replica 2 (term 6); before:
+    ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+    127.0.0.1:17611          1 follower       6      2      206      206      206      203      200 
+    127.0.0.1:17612          2 leader         6      2      206      206      206      203      200 serving
+    127.0.0.1:17613          3 follower       6      2      206      206      206      203      200 
+  submission sent to the isolated leader: not acknowledged after 2162 ms: fleetctl: deadline exceeded: Deadline Exceeded
+  the other two elected replica 3 leader of term 8 443 ms after the isolation, serving 448 ms after it
+  majority side: submitted job majority: 84
+  while isolated (replica 2 still thinks it leads term 6, but cannot commit):
+    ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+    127.0.0.1:17611          1 follower       8      3      255      255      255      203      248 
+    127.0.0.1:17612          2 leader         6      2      206      206      215      203      200 serving, ISOLATED
+    127.0.0.1:17613          3 leader         8      3      255      255      255      203      248 serving
+  isolated replica: commit index 206 -> 206, last index 215 (its uncommitted entries)
+  healed: replica 2 stepped down 28 ms after the isolation was lifted (its log), and had caught up (applied >= the leader's commit when polled) 179 ms after:
+    ADDRESS                 ID ROLE        TERM LEADER   COMMIT  APPLIED     LAST     SNAP      LSN NOTE
+    127.0.0.1:17611          1 follower       8      3      255      255      256      203      248 
+    127.0.0.1:17612          2 follower       8      3      255      255      256      203      248 
+    127.0.0.1:17613          3 leader         8      3      256      256      259      203      249 serving
+  tasks of the submission the isolated leader took: 0 (its entries were overwritten); of the majority's: 1
+  log: 21:06:51.224 fleetmaster[2]: no longer serving (leader of term 6); discarded the state not yet committed
+
+== stopping the client; waiting for every acknowledged task to finish
+
+== summary over 5 leader SIGKILLs and one partition
+  kill -> new leader elected             min   164  median   184  max   251 ms
+  kill -> new leader serving             min   171  median   188  max   257 ms
+  kill -> scheduling (agents reported)   min   226  median   361  max   433 ms
+  restart -> killed replica caught up    min   173  median   174  max   179 ms
+  leaderships over the run: 7, terms with two leaders: 0
+  log compactions: 3, snapshot restores (startup or InstallSnapshot): 0
+  batch tasks acknowledged to the client: 86 (refused: 0 submissions, outcome unknown: 0)
+  batch tasks the master has: 86 (any above 86 were committed after the client gave up)
+  batch jobs admitted twice: 0
+  lost (acknowledged but not succeeded): 0
+  services still running at attempt 1: 4 of 4
+  placed but never started before a leader died (requeued at the node's first report): 16
+  tasks with event-log instances: 91, instances: 91, tasks started more than once: 0
+  overlapping instances of one task: 0
+  agents fenced: 0, nodes re-registered: 0
+  PASS: no committed task lost, none ran twice concurrently, one leader per term
+
+== teardown
+no task processes left behind
+exit=0

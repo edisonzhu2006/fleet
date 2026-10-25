@@ -91,3 +91,36 @@ no task processes left behind
 
 == teardown
 no task processes left behind
+
+### m4b regression run (after the agent's redirect + retry-backoff change): TRIALS=5 bench/master_failure.sh
+== machine: Apple M5 Pro, load: 2.46 3.88 4.27
+  submitted job svc: 0 1 2 3
+
+== 5 SIGKILL trials (master restarted at once each time)
+  trial      lsn kill->serving  kill->schedule       window  recovered from
+  1           57         25 ms          505 ms       480 ms  no snapshot, replayed 57, skipped 0, torn 0 B
+  2          112         32 ms          496 ms       465 ms  no snapshot, replayed 112, skipped 0, torn 0 B
+  3          158         27 ms          503 ms       477 ms  no snapshot, replayed 158, skipped 0, torn 0 B
+  4          186         27 ms          484 ms       458 ms  no snapshot, replayed 186, skipped 0, torn 0 B
+  5          246         24 ms          174 ms       150 ms  snapshot at lsn 201, replayed 45, skipped 0, torn 0 B
+
+== stopping the client; waiting for every acknowledged task to finish
+
+== summary over 5 master SIGKILLs
+  kill -> serving RPCs           min    24  median    27  max    32 ms
+  kill -> scheduling (recovered) min   174  median   496  max   505 ms
+  report window                  min   150  median   465  max   480 ms
+  snapshots written during the run: 1
+  batch tasks acknowledged to the client: 90 (submissions refused while the master was down: 0)
+  batch tasks the master has: 90 (any above 90 were committed, then the master died before replying)
+  lost (acknowledged but not succeeded): 0
+  services still running at attempt 1: 4 of 4
+  placed before a crash but never started (requeued at the node's first report): 14
+  tasks with event-log instances: 94, instances: 94, tasks started more than once: 0
+  overlapping instances of one task: 0
+  agents fenced: 0, nodes re-registered: 0
+  PASS: no task lost, none ran twice concurrently
+
+== teardown
+no task processes left behind
+exit=0

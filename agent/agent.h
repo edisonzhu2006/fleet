@@ -30,6 +30,17 @@
 // then registers again. Before this response arrives the agent cannot
 // know it was fenced; NOTES.md m3 discusses that window and why a lease
 // is what closes it.
+//
+// SEVERAL MASTERS (m4b). master_address may list every fleetmaster
+// replica, comma-separated. Only the Raft leader serves; any other
+// replica answers UNAVAILABLE with the leader's address as a hint
+// (common/leader_redirect.h). The agent follows a hint at once (up to two
+// hops per beat); with no hint, or no answer, it moves to the next address
+// and retries after a backoff that starts at 50 ms and doubles up to the
+// heartbeat interval, so after a leader dies it finds the new one within
+// a few hundred ms instead of a full interval or more. It needs no new
+// registration: its epoch is in the replicated state, so the new leader
+// accepts its next heartbeat as is.
 
 #include <chrono>
 #include <compare>
@@ -42,6 +53,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "fleet.grpc.pb.h"
 #include "model.h"
@@ -50,6 +62,7 @@
 namespace fleet {
 
 struct AgentOptions {
+  // One address, or every replica's, comma-separated (m4b).
   std::string master_address = "127.0.0.1:7070";
   std::string name;
   Resources capacity;
@@ -139,10 +152,21 @@ class Agent {
   // kill_all() plus an exit event for every instance it took down.
   void kill_everything();
   static Key key_of(const v1::TaskInstance& inst);
+  // One RPC to the current master, following a leader redirect (m4b).
+  // f(stub, ctx) makes the call; the context gets the RPC deadline.
+  template <typename F>
+  grpc::Status call_master(F&& f);
+  v1::Master::Stub& stub_for(const std::string& address);
 
   AgentOptions options_;
   std::unique_ptr<Runtime> runtime_;
-  std::unique_ptr<v1::Master::Stub> stub_;
+  // The master replicas, and the one calls go to now (loop thread only).
+  std::vector<std::string> masters_;
+  size_t current_ = 0;
+  std::map<std::string, std::unique_ptr<v1::Master::Stub>> stubs_;
+  // 0 while the masters answer; after an unanswered call, how long until
+  // the next attempt (doubling, capped at the heartbeat interval).
+  std::chrono::milliseconds retry_delay_{0};
 
   // Loop-thread state (no lock needed).
   std::FILE* events_ = nullptr;  // options_.event_log, opened by run()

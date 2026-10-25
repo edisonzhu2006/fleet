@@ -26,7 +26,10 @@
 //
 // DURABLE VS SOFT STATE. Durable: nodes (name, shape, state, epoch, drain
 // flag), tasks (spec, state, placement, attempt, restart counters, backoff
-// deadline, last exit), the epoch counter, the LSN. Soft, never logged:
+// deadline, last exit), the epoch counter, the LSN, and (m4b) the request
+// ids of admitted submissions, so a retried submission is answered rather
+// than admitted twice, on every replica and after a restart. Soft, never
+// logged:
 // heartbeat times and suspect flags (the FailureDetector, owned by
 // MasterCore). Soft state describes the last few seconds; after a restart
 // the master relearns it from heartbeats, and logging it would mean a
@@ -104,6 +107,13 @@ class MasterState {
   const TaskMeta& task(TaskId id) const { return tasks_.at(id); }
   size_t node_count() const { return nodes_.size(); }
   std::optional<NodeId> find_node(const std::string& name) const;
+  // A submission admitted with this request id (m4b): its first task id
+  // and count. Kept for the life of the state, like the tasks themselves.
+  struct Submission {
+    uint32_t first_task_id = 0;
+    uint32_t count = 0;
+  };
+  std::optional<Submission> find_submission(const std::string& request_id) const;
   // Tasks in backoff, ordered by when they become pending again (wall ms),
   // so the tick pops only expired ones: O(log n) each, not a scan.
   const std::set<std::pair<int64_t, TaskId>>& backoff() const { return backoff_; }
@@ -145,6 +155,7 @@ class MasterState {
   std::vector<NodeMeta> nodes_;  // parallel to cluster_.nodes()
   std::vector<TaskMeta> tasks_;  // parallel to cluster_.tasks()
   std::map<std::string, NodeId> node_by_name_;
+  std::map<std::string, Submission> submissions_;  // by request id
   std::set<std::pair<int64_t, TaskId>> backoff_;
   uint64_t next_epoch_ = 1;  // 0 is never issued: it means "revoked"
   uint64_t lsn_ = 0;

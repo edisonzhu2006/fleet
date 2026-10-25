@@ -5,7 +5,7 @@ plane places tasks on nodes by CPU and memory, preempts lower-priority
 work, and when a node dies reschedules its tasks elsewhere, resuming
 streaming jobs from their last checkpoint.
 
-Status: m4 done. m1: core model and scheduler as a pure library,
+Status: m4b done. m1: core model and scheduler as a pure library,
 `fleetsim` simulator, placement-strategy comparison. m2: gRPC control
 plane (`proto/fleet.proto`), `fleetmaster`, `fleetlet` agents with a
 fork/exec `ProcessRuntime`, the `fleetctl` CLI, and a local 3-agent
@@ -36,8 +36,21 @@ at once, every agent keeps its registration; the master serves RPCs again
 about 30 ms after the kill and is scheduling again, once every agent has
 reported, a median of 241 ms and 340 ms after it in two runs of 20 (max
 525 ms; NOTES.md).
-Decisions and measurements are in [NOTES.md](NOTES.md). m4b (Raft
-replication of the same log) is next. See [docs/PLAN.md](docs/PLAN.md).
+m4b: the control plane is replicated with Raft, implemented here
+(`raft/`): fleetmaster runs as 3 replicas (`--id`, `--peers`), the m4 log
+records are the Raft log's commands, every replica applies the committed
+ones in order, and only the leader schedules and answers; the others
+redirect agents and fleetctl to it. The Raft core is a pure state machine
+(messages in; messages, persistence and committed entries out), checked by
+a deterministic simulation over 2,500 seeds with message loss,
+reordering, duplication, partitions and crashes for election safety, log
+matching, leader completeness, state machine safety and stale reads; every
+reply waits until it is committed and a majority has confirmed the
+leader (ReadIndex), so an isolated leader cannot answer anyone.
+`bench/leader_failover.sh` SIGKILLs the leader 20 times mid-workload and
+then partitions it (numbers in NOTES.md m4b).
+Decisions and measurements are in [NOTES.md](NOTES.md). m5 (stateful
+jobs) is next. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Run a local cluster
 
@@ -46,6 +59,7 @@ bench/local_cluster.sh      # master + 3 agents, a mix of real tasks, clean tear
 bench/node_failure.sh       # SIGKILL an agent 10 times: time to dead, time to running elsewhere
 bench/master_failure.sh     # SIGKILL the master 20 times mid-workload: nothing lost, nothing doubled
 bench/wal_commit.sh         # sync latency, group commit vs per-record sync, replay vs snapshot
+bench/leader_failover.sh    # 3 replicas: SIGKILL the leader 20 times, then partition it
 ```
 
 Or by hand:
@@ -75,6 +89,31 @@ next heartbeat to the restarted master is accepted under the same epoch.
 `--recovery-window-ms N` (longest wait for agents to report after a
 restart, default 1000) tune it. Without `--state-dir` the master keeps
 state in memory only, as before m4.
+
+## Run a replicated control plane (m4b)
+
+Three replicas, each with its own state directory (Raft term and vote, log,
+snapshot), and agents and fleetctl given every address:
+
+```
+P=1=127.0.0.1:7071,2=127.0.0.1:7072,3=127.0.0.1:7073
+M=127.0.0.1:7071,127.0.0.1:7072,127.0.0.1:7073
+for i in 1 2 3; do ./build/bin/fleetmaster --id $i --peers $P --state-dir /private/tmp/fleet/r$i & done
+./build/bin/fleetlet --master $M --name n1 --cpu 4000 --mem 4096 &
+./build/bin/fleetctl --master $M status     # each replica's role, term, commit and applied index
+./build/bin/fleetctl --master $M submit --job hello --cpu 500 --mem 64 -- /bin/sh -c 'sleep 5'
+kill -USR1 <leader pid>     # cut the leader off from the other replicas; -USR2 reconnects it
+```
+
+Only the leader serves; a follower answers UNAVAILABLE with the leader's
+address in the `fleet-leader` trailing metadata, and the clients follow
+it. Every submission carries a random request id, so fleetctl retries it
+safely across a failover: a retry of one that was committed before its
+reply was lost gets the same task ids back instead of a second job. Raft
+timing:
+`--election-min-ms 150 --election-max-ms 300 --raft-heartbeat-ms 50`
+(defaults), `--reply-timeout-ms 1000`, `--snapshot-every N` (entries between
+log compactions). Without `--peers`, fleetmaster is the m4 single master.
 
 Failure handling is set on the master: `--heartbeat-ms 500 --suspect-after 3
 --dead-after 6 --tick-ms 100` (the defaults) and, for restart policies,

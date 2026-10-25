@@ -13,6 +13,8 @@
 # fleet.proto is the RPC contract; wal.proto (m4) is the master's storage
 # format (log records and snapshots) and has no services, so it needs only
 # --cpp_out. It imports fleet.proto for Resources and the state enums.
+# raft.proto (m4b) is the replica-to-replica contract (the Raft RPCs) plus
+# Raft's own storage formats; it has a service, so it gets both plugins.
 set(FLEET_PROTO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/fleet.proto)
 set(FLEET_WAL_PROTO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/wal.proto)
 set(FLEET_PROTO_OUT ${CMAKE_CURRENT_BINARY_DIR}/gen)
@@ -25,6 +27,12 @@ set(FLEET_PROTO_GENERATED
 set(FLEET_WAL_PROTO_GENERATED
   ${FLEET_PROTO_OUT}/wal.pb.cc
   ${FLEET_PROTO_OUT}/wal.pb.h)
+set(FLEET_RAFT_PROTO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/raft.proto)
+set(FLEET_RAFT_PROTO_GENERATED
+  ${FLEET_PROTO_OUT}/raft.pb.cc
+  ${FLEET_PROTO_OUT}/raft.pb.h
+  ${FLEET_PROTO_OUT}/raft.grpc.pb.cc
+  ${FLEET_PROTO_OUT}/raft.grpc.pb.h)
 
 add_custom_command(
   OUTPUT ${FLEET_PROTO_GENERATED}
@@ -48,6 +56,19 @@ add_custom_command(
   COMMENT "protoc: generating wal.proto messages"
   VERBATIM)
 
-add_library(fleet_proto ${FLEET_PROTO_GENERATED} ${FLEET_WAL_PROTO_GENERATED})
+add_custom_command(
+  OUTPUT ${FLEET_RAFT_PROTO_GENERATED}
+  COMMAND $<TARGET_FILE:protobuf::protoc>
+    --proto_path=${CMAKE_CURRENT_SOURCE_DIR}
+    --cpp_out=${FLEET_PROTO_OUT}
+    --grpc_out=${FLEET_PROTO_OUT}
+    --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
+    ${FLEET_RAFT_PROTO_SRC}
+  DEPENDS ${FLEET_RAFT_PROTO_SRC} protobuf::protoc gRPC::grpc_cpp_plugin
+  COMMENT "protoc: generating raft.proto messages and gRPC stubs"
+  VERBATIM)
+
+add_library(fleet_proto ${FLEET_PROTO_GENERATED} ${FLEET_WAL_PROTO_GENERATED}
+                        ${FLEET_RAFT_PROTO_GENERATED})
 target_include_directories(fleet_proto SYSTEM PUBLIC ${FLEET_PROTO_OUT})
 target_link_libraries(fleet_proto PUBLIC gRPC::grpc++ protobuf::libprotobuf)

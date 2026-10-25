@@ -1584,3 +1584,95 @@ build --target clean` then a full build, 55 steps: the only warning is
 GoogleTest's own `-Wcharacter-conversion` in gtest-printers.h, which is not
 compiled with fleet_flags; the ASan rebuild of 38 files printed only that
 same one).
+
+## 2026-10-25: m4b, Raft-replicated control plane
+
+**Problem.** m4's master survives its own crash (write-ahead log plus
+snapshot) but not losing its machine or disk. Borgmaster runs 5 replicas
+that agree through Paxos so losing one changes nothing; fleet needed the
+same property.
+
+**Decision: 3 fleetmaster replicas agreeing through Raft, implemented
+here (`raft/`), with the m4 WAL records as the Raft log commands.**
+`MasterCore` still turns each decision into a `v1::WalRecord` and
+`MasterState::apply` is still the single deterministic function that
+changes durable state. What changed is where a record goes: into the Raft
+log instead of a local file, and "durable" now means "committed on a
+majority". Only the leader schedules and answers agents and fleetctl;
+followers redirect callers to the leader.
+
+**Why Raft over Paxos.** Same guarantee, but Raft is specified as one
+concrete algorithm (the paper's Figure 2) with a single strong leader,
+which is exactly the shape of a scheduler: one decider at a time.
+Multi-Paxos leaves leader election and log management to the implementer,
+which is where homegrown Paxos implementations go wrong.
+
+**Why implement it instead of storing state in etcd.** etcd would give
+the same fault tolerance, but every scheduling decision would be a network
+round trip to a separate service, and the consensus layer would be a black
+box. Keeping the replicated log inside the master keeps decisions local
+and makes the algorithm something to explain. Cost: Raft is easy to get
+subtly wrong, which is why the testing below is the heaviest in the
+project.
+
+**Why a pure core (`raft/raft_core.h`).** The core takes messages and
+clock readings as explicit inputs and returns messages to send, state to
+persist and committed entries. It reads no clock and does no I/O. That
+makes it drivable by a deterministic simulation and replayable from a
+seed, which is how etcd's raft library is built for the same reason. The
+gRPC transport and the disk storage are thin layers around it.
+
+**Why 3 replicas and not 5.** A majority of 3 tolerates 1 failure; a
+majority of 5 tolerates 2. Borg uses 5 because it runs at a scale where
+two simultaneous failures are routine. 3 is enough to demonstrate and
+test every behavior, at lower cost per write.
+
+**Ordering rules carried over from m4, now replicated.** A reply to an
+agent or fleetctl is sent only after (1) everything the leader had
+appended when computing it is committed on a majority, and (2) a ReadIndex
+round confirms no newer leader existed when the call arrived. A replica
+cut off from the others therefore cannot answer at all, so it cannot hand
+out stale state. A new leader appends a no-op, builds its scheduler state
+only after that no-op commits (so it has every earlier committed entry),
+then waits for agents to report before scheduling, exactly like m4's
+restart path.
+
+**Timing.** Election timeout randomized in 150 to 300 ms (paper section
+5.2), leader heartbeats every 50 ms. Heartbeats must be much shorter than
+the minimum timeout, or followers would start elections against a healthy
+leader.
+
+**Not implemented (and what each would add).** Membership changes
+(adding or removing replicas without downtime), pre-vote (stops a replica
+that was partitioned from disrupting the cluster with a higher term when
+it returns), leadership transfer (planned handoff for maintenance),
+check-quorum (a leader steps down on its own when it loses its majority,
+instead of only when it hears a higher term).
+
+**Verification (2026-10-25, Apple M5 Pro, Release build).**
+- Deterministic simulation (`tests/raft_sim_test.cpp`): 30 blocks, 2,500
+  randomized cluster histories (2,000 with 3 replicas, 500 with 5) with
+  message loss, delay, duplication, reordering, partitions, crashes and
+  restarts, and log compaction via InstallSnapshot. Election Safety, Log
+  Matching, Leader Completeness and State Machine Safety checked after
+  every event: all 30 blocks pass (29.6 min wall time).
+- Unit and integration tests: 190 pass; the 3 real-Docker tests skip
+  because the Docker daemon was unresponsive in this session. One
+  fake-Docker test failed once while about a dozen orphaned
+  ThreadSanitizer runs pushed the load average to 50; on a quiet machine
+  the fake-Docker suite passed 5 out of 5 repeats (75 test runs).
+- `bench/leader_failover.sh` (results in
+  `bench/results/leader_failover.txt`): 20 trials of SIGKILLing the
+  leader mid-workload, the killed replica restarted each time. Kill to new
+  leader elected: min 135, median 210, max 266 ms. Kill to scheduling
+  again (agents reported): median 310, max 505 ms. Restarted replica
+  caught up in a median 64 ms. 22 leaderships, 0 terms with two leaders,
+  0 committed tasks lost, 0 tasks running twice concurrently.
+- Partition test: the leader was cut off from both followers; they
+  elected a new leader 246 ms later; the isolated old leader could not
+  commit, and on healing it stepped down and discarded its uncommitted
+  state.
+- Not completed this session: a full ThreadSanitizer and AddressSanitizer
+  pass over the replicated build. The runs were started by the build
+  session but were orphaned when it stalled, and were killed to free the
+  machine. This is the first item for the review pass.

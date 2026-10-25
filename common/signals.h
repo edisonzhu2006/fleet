@@ -36,4 +36,26 @@ inline int wait_for_shutdown_signal() {
   return sig;
 }
 
+// A fleetmaster replica (m4b) also takes SIGUSR1 and SIGUSR2: isolate it
+// from the other replicas, and lift that, for the partition test. Same
+// scheme: blocked everywhere, received by sigwait in main.
+inline sigset_t control_signals() {
+  sigset_t set = shutdown_signals();
+  sigaddset(&set, SIGUSR1);
+  sigaddset(&set, SIGUSR2);
+  return set;
+}
+
+inline void block_control_signals() {
+  sigset_t set = control_signals();
+  pthread_sigmask(SIG_BLOCK, &set, nullptr);
+}
+
+inline int wait_for_control_signal() {
+  sigset_t set = control_signals();
+  int sig = 0;
+  sigwait(&set, &sig);
+  return sig;
+}
+
 }  // namespace fleet

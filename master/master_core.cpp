@@ -539,6 +539,24 @@ grpc::Status MasterCore::submit(const v1::SubmitRequest& req,
             "unknown restart policy " + std::to_string(req.restart_policy())};
   }
   const uint32_t count = req.count() == 0 ? 1 : req.count();
+  // A retry of a submission already admitted (m4b): answer with its task
+  // ids, admit nothing, log nothing. Checked before quota, so the retry
+  // gets the first attempt's answer even if the quota has filled since.
+  // The id names the submission; reusing one for a different job is a
+  // client bug, refused rather than silently answered with another job.
+  if (!req.request_id().empty()) {
+    if (const auto prior = state_.find_submission(req.request_id())) {
+      if (state_.cluster().task(prior->first_task_id).job != req.job()) {
+        return {grpc::StatusCode::ALREADY_EXISTS,
+                "request id " + req.request_id() + " was used for job " +
+                    state_.cluster().task(prior->first_task_id).job};
+      }
+      for (uint32_t i = 0; i < prior->count; ++i) resp->add_task_ids(prior->first_task_id + i);
+      log("job " + req.job() + ": request " + req.request_id() +
+          " already admitted; answered with its " + std::to_string(prior->count) + " task id(s)");
+      return grpc::Status::OK;
+    }
+  }
   if (count > options_.max_tasks_per_submit) {
     return {grpc::StatusCode::INVALID_ARGUMENT,
             "count " + std::to_string(count) + " exceeds " +
@@ -568,6 +586,7 @@ grpc::Status MasterCore::submit(const v1::SubmitRequest& req,
   *ts->mutable_argv() = req.argv();
   ts->set_image(req.image());
   ts->set_restart_policy(to_proto(*policy));
+  ts->set_request_id(req.request_id());
   emit(std::move(r));
   for (uint32_t i = 0; i < count; ++i) resp->add_task_ids(first + i);
   needs_schedule_ = true;
